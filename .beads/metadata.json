@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "cordis_python",
+  "project_id": "895cfc6f-5031-41bb-bbba-b7854ed39702"
+}
