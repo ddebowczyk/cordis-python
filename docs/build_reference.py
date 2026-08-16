@@ -18,6 +18,14 @@ in a second place would create a second thing to be wrong.
 
 Run: ``docs/build_reference.py`` (or ``just docs``). With ``--check`` it writes
 nothing and exits non-zero if the file on disk is stale, which is what CI runs.
+
+The output must not depend on which interpreter produced it: CI pins no version
+for this step, so a file that reads differently on 3.11 than on 3.13 fails the
+check for a reason that has nothing to do with the library. Everything rendered
+here therefore comes from the package's own declarations -- a docstring the
+name itself carries, a signature the library actually writes -- and never from
+a stdlib base class, whose wording and signatures CPython revises between
+releases.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ import importlib
 import inspect
 import re
 import sys
+from enum import Enum
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -105,9 +114,32 @@ def _owner(name: str, records: list[Record]) -> Record | None:
 
 
 def _summary(obj: object) -> str:
-    """The first paragraph of a docstring, on one line."""
-    text = inspect.getdoc(obj) or ""
-    paragraph = text.split("\n\n", 1)[0]
+    """The first paragraph of the name's *own* docstring, on one line.
+
+    `inspect.getdoc` falls back to an inherited docstring, and for anything
+    that is not a class or a function that means documenting the value's type:
+    `SETTLED` is a frozenset, so the reference grew "Build an immutable
+    unordered collection of unique elements." That is not a description of
+    `SETTLED`, and CPython rewords those strings between releases -- which is
+    how a generated file came to depend on which interpreter generated it.
+    """
+    if not _home(obj):
+        # A name bound to something the standard library defines documents that
+        # object rather than the name: `PluginTarget` is `object`, whose
+        # docstring reads "The base class of the class hierarchy" on CPython
+        # and "The most base type" on PyPy. The same bug in another dress.
+        return ""
+    if inspect.isclass(obj):
+        # `vars`, not `getdoc`: a class with no docstring of its own must not
+        # inherit its base's, which would attribute a parent's contract to it.
+        text = vars(obj).get("__doc__")
+    elif inspect.isfunction(obj):
+        text = obj.__doc__
+    else:
+        text = None
+    if not isinstance(text, str):
+        return ""
+    paragraph = inspect.cleandoc(text).split("\n\n", 1)[0]
     return " ".join(paragraph.split())
 
 
@@ -146,6 +178,12 @@ def _bare(annotation: object) -> object:
 def _signature(name: str, obj: object) -> str:
     """``name`` as a reader would write it, with its parameters when it has any."""
     if not (inspect.isclass(obj) or inspect.isfunction(obj)):
+        return name
+    if isinstance(obj, type) and issubclass(obj, Enum):
+        # An enum is read, not constructed. Whatever `inspect` reports here is
+        # `EnumType.__call__` -- `(*values)` on 3.13, a long lookup signature
+        # on 3.11 -- so rendering it both misleads the reader and makes the
+        # generated file depend on the interpreter that generated it.
         return name
     try:
         found = inspect.signature(obj)

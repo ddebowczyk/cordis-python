@@ -77,7 +77,7 @@ One transition of the binding set.
 
 A read-only description of one binding.
 
-### `ChangeKind(*values)`
+### `ChangeKind`
 
 *class* &middot; `cordis.registry`
 
@@ -135,8 +135,6 @@ Tier 1 &middot; [`plugin-mounting`](../spec/capabilities/03-plugin-mounting.yaml
 
 *str*
 
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
-
 ### `InvalidPluginError(plugin: object, reason: str)`
 
 *class* &middot; `cordis.errors`
@@ -164,8 +162,6 @@ A root instance and the registry its plugin tree binds services in.
 ### `PluginTarget()`
 
 *class*
-
-The base class of the class hierarchy.
 
 ### `config_of(ctx: Context) -> object`
 
@@ -203,7 +199,7 @@ One mounted instance, seen as a state machine.
 
 One application's status channel and its definition of "settled".
 
-### `FiberState(*values)`
+### `FiberState`
 
 *class* &middot; `cordis.fiber`
 
@@ -219,8 +215,6 @@ A transition outside the permitted set was attempted.
 
 *frozenset*
 
-Build an immutable unordered collection of unique elements.
-
 ### `StatusChange(fiber: Fiber, previous: FiberState, new: FiberState)`
 
 *class* &middot; `cordis.fiber`
@@ -231,13 +225,9 @@ One transition, as its listeners see it (SEM-005).
 
 *str*
 
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
-
 ### `TRANSITIONS`
 
 *dict*
-
-dict() -> new empty dictionary dict(mapping) -> new dictionary initialized from a mapping object's (key, value) pairs dict(iterable) -> new dictionary initialized as if via: d = {} for k, v in iterable: d[k] = v dict(**kwargs) -> new dictionary initialized with the name=value pairs in the keyword argument list. For example: dict(one=1, two=2)
 
 ### `spawn(...)`
 
@@ -261,13 +251,9 @@ Declared injections form a cycle, so no member of it can ever activate.
 
 *str*
 
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
-
 ### `Token`
 
 *str*
-
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
 
 ### `dependencies_of(target: object) -> tuple[str, ...]`
 
@@ -339,8 +325,6 @@ An event was dispatched through a mode it was not declared with.
 
 *str*
 
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
-
 ### `NextCalledTwiceError(event: str, listener: str)`
 
 *class* &middot; `cordis.errors`
@@ -380,8 +364,6 @@ A schema's ``validate`` returned an awaitable.
 ### `CONFIG_SCHEMA_ATTR`
 
 *str*
-
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
 
 ### `ConfigIssue(path: tuple[str | int, ...], message: str)`
 
@@ -447,13 +429,9 @@ Tier 2 &middot; [`service-isolation`](../spec/capabilities/08-service-isolation.
 
 *Realm* &middot; `cordis.registry`
 
-An isolation boundary for bindings.
-
 ### `Isolation`
 
 *str*
-
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
 
 ### `Realm(label: str = 'default', *, parent: Realm | None = None)`
 
@@ -513,8 +491,6 @@ Tier 2 &middot; [`service-interception`](../spec/capabilities/09-service-interce
 
 *str*
 
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
-
 ### `InterceptResolver`
 
 *class* &middot; `cordis.intercept`
@@ -524,8 +500,6 @@ What a service defines when it wants to fold the chain itself.
 ### `Interception`
 
 *str*
-
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
 
 ### `effective_config(...)`
 
@@ -591,13 +565,9 @@ An :class:`EventBus` viewed through one context.
 
 *str*
 
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
-
 ### `Filter`
 
 *str*
-
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
 
 ### `filter_of(ctx: Context) -> Filter | None`
 
@@ -632,8 +602,6 @@ One instance, frozen at a point in the event loop.
 ### `MOUNT_NOTE_PREFIX`
 
 *str*
-
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
 
 ### `PendingReport(uid: int, label: str, blocked: tuple[Blockage, ...])`
 
@@ -693,13 +661,9 @@ A logger service producing structured records tagged with their originating fibe
 
 *int*
 
-int([x]) -> integer int(x, base=10) -> integer
-
 ### `DETACHED`
 
 *str*
-
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
 
 ### `ExportFailure(exporter: str, record: Record, error: BaseException)`
 
@@ -717,9 +681,7 @@ Anything that can be handed a record. Structural: no base class.
 
 *str*
 
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
-
-### `Level(*values)`
+### `Level`
 
 *class* &middot; `cordis.logging`
 
@@ -770,8 +732,6 @@ Time, as scheduling needs it: reading it and waiting on it.
 ### `Report`
 
 *str*
-
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
 
 ### `Schedule(handle: EffectHandle, counts: _Counts)`
 
@@ -849,8 +809,6 @@ Anything that can produce an entry list.
 
 *str*
 
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
-
 ### `ImportTargets(ctx: Context)`
 
 *class* &middot; `cordis.loader`
@@ -921,8 +879,6 @@ A restricted, side-effect-free expression language usable in specific entry fiel
 
 *int*
 
-int([x]) -> integer int(x, base=10) -> integer
-
 ### `CompiledExpr(source: str, tree: ast.Expression)`
 
 *class* &middot; `cordis.expr`
@@ -932,8 +888,6 @@ A source string that has already been checked against the grammar.
 ### `ENVELOPE`
 
 *str*
-
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
 
 ### `Expr(source: str)`
 
@@ -951,8 +905,6 @@ A configuration expression was rejected or failed to evaluate.
 
 *dict*
 
-dict() -> new empty dictionary dict(mapping) -> new dictionary initialized from a mapping object's (key, value) pairs dict(iterable) -> new dictionary initialized as if via: d = {} for k, v in iterable: d[k] = v dict(**kwargs) -> new dictionary initialized with the name=value pairs in the keyword argument list. For example: dict(one=1, two=2)
-
 ### `FunctionSource`
 
 *class* &middot; `cordis.expr`
@@ -962,8 +914,6 @@ Extra allow-listed functions, bound as a service.
 ### `MAX_DEPTH`
 
 *int*
-
-int([x]) -> integer int(x, base=10) -> integer
 
 ### `Opaque(why: str)`
 
@@ -975,13 +925,9 @@ A value an expression is not permitted to read, and why.
 
 *GenericAlias*
 
-Built-in immutable sequence.
-
 ### `TAG`
 
 *str*
-
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
 
 ### `compile_expr(source: str, /, *, entry_id: str, field: str) -> CompiledExpr`
 
@@ -1053,13 +999,9 @@ An ordered sequence of patch layers is folded onto a base entry list, where each
 
 *str*
 
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
-
 ### `Fields`
 
 *GenericAlias*
-
-A Mapping is a generic container for associating key/value pairs.
 
 ### `Layer(source: str, patches: tuple[Patch, ...] = ())`
 
@@ -1112,8 +1054,6 @@ Reimports changed modules and has the loader rebuild what they reach.
 ### `RELOAD_FLAG`
 
 *str*
-
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
 
 ### `ReloadFailure(module: str, error: BaseException)`
 
@@ -1178,8 +1118,6 @@ A pattern layered on context tagging and event filtering in which the context a 
 ### `SUBJECT_KEY`
 
 *str*
-
-str(object='') -> str str(bytes_or_buffer[, encoding[, errors]]) -> str
 
 ### `Scope(key: object, parent: Scope | None, label: str)`
 
@@ -1256,8 +1194,6 @@ A listener that raised, and what it was being told at the time.
 ### `UNSET`
 
 *_Unset* &middot; `cordis.seam`
-
-The sentinel's type, so it prints as itself in a repr or a traceback.
 
 ### `resolve_spec(spec: type[T], raw: object = None, /, *, plugin: str | None = None) -> T`
 
