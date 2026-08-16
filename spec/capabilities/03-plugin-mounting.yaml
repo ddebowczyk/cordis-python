@@ -1,0 +1,593 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: plugin-mounting
+title: Plugin mounting — the unit of composition
+status: implemented
+tier: 1
+summary: >-
+  `ctx.plugin(target, config)` normalises any supported plugin form into a
+  mounted instance with its own child context and effect scope, and returns a
+  handle whose disposal unloads that instance and everything it mounted.
+
+problem:
+  statement: >-
+    An application must be assemblable from independently authored units that
+    know nothing about each other, can be added or removed at runtime, and
+    cannot leak past their own unload — without any of them importing a
+    framework runtime or participating in a startup sequence.
+  without_this:
+    - Composition happens at import time, so the set of loaded features is
+      fixed by which modules were imported and in what order.
+    - Removing a feature means restarting the process.
+    - A unit's sub-units have no owner, so unloading a parent leaves orphans.
+  rejected_alternatives:
+    - option: setuptools entry points as the only extension mechanism.
+      why_rejected: >-
+        Discovery-time only, package-granular, and not removable at runtime.
+        Entry points remain useful as a *source* of plugin targets, layered on
+        top of this capability rather than replacing it.
+    - option: Require every plugin to subclass a Plugin base class.
+      why_rejected: >-
+        Forces a framework import into every unit and makes the trivial case —
+        a module with an `apply` function — ceremonious.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/core/src/registry.ts
+      symbol: "RegistryService.plugin, Plugin, Plugin.Base"
+    - repo: cordis
+      path: packages/core/src/fiber.ts
+      symbol: "Fiber._execute"
+    - repo: kb-docs
+      path: modular-software/cordis-in-22-steps.md
+      symbol: "Steps 1-3"
+
+depends_on: [context-tree, effect-scope, service-registry]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      A plugin target is one of: a callable taking `(ctx)` or `(ctx, config)`;
+      an object or module exposing `apply`; a `Service` subclass. Anything else
+      raises `InvalidPluginError` before any state is created. A generator or
+      async-generator function is *not* a callable form, even though it has the
+      right arity: calling it runs none of its body.
+    rationale: >-
+      One normalisation point; an unrecognised target must fail at the mount
+      call site, not halfway through construction. The generator clause is what
+      turns a silent no-op — an instance that reaches ACTIVE having executed
+      nothing — into a rejection at the call site.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      Each mount creates exactly one child context and one child effect scope,
+      both owned by the resulting instance; the plugin body receives the child
+      context, never the parent.
+    rationale: >-
+      Ownership is what makes unload total. Handing a plugin its parent context
+      would let its registrations outlive it.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      Mounting the same target twice produces two independent instances with
+      separate contexts, scopes, and configs.
+    rationale: >-
+      Plugins are values, not singletons; the loader mounts the same module
+      several times with different configs routinely.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      Disposing an instance disposes every instance it mounted, transitively,
+      before its own effects unwind.
+    rationale: >-
+      Children may hold references into the parent's resources; they must be
+      gone first.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      `ctx.plugin(...)` returns immediately with a handle and is also
+      awaitable; awaiting it waits for the instance to reach a settled state
+      and re-raises any startup exception.
+    rationale: >-
+      Callers that want fire-and-forget composition and callers that want to
+      assert successful startup need the same call to serve both, or every
+      call site grows a branch.
+    deviation:
+      upstream: "Upstream returns a Fiber that is also a PromiseLike."
+      rationale: >-
+        Same shape in Python via `__await__` on the handle; noted because it is
+        unusual for a Python API and must be documented, not discovered.
+
+  - id: SEM-006
+    kind: MUST-NOT
+    rule: >-
+      Mount order MUST NOT affect the final state of the plugin tree, for any
+      set of plugins whose dependencies are expressed through injection.
+    rationale: >-
+      This is the property that lets configuration files list rows in any order
+      and lets the loader start rows concurrently. It is the single most
+      load-bearing guarantee in the system.
+
+  - id: SEM-007
+    kind: MUST
+    rule: >-
+      An exception raised by a plugin body marks that instance failed and
+      unwinds its own scope; it MUST NOT unload the parent or any sibling.
+    rationale: >-
+      One broken plugin taking down the tree defeats the purpose of isolating
+      units.
+
+  - id: SEM-008
+    kind: MUST
+    rule: >-
+      Mounting on an instance that is not live — failed, unloading, or disposed
+      — raises `InactiveScopeError` and creates nothing. Liveness is decided on
+      the instance's state, not on whether its scope happens to still be
+      undisposed.
+    rationale: >-
+      A failed instance's rollback is scheduled rather than immediate, so its
+      scope outlives its failure by an unspecified number of event-loop turns.
+      Deciding on the scope would make the same mount succeed or fail depending
+      on scheduling, and a mount that succeeds into a dying parent is unwound
+      moments later with nothing to show for it.
+    deviation:
+      upstream: >-
+        Upstream has no equivalent rule; a disposed fiber's context simply has
+        nothing left to register against.
+      rationale: >-
+        The asyncio rollback introduces a window upstream does not have, so the
+        rule has to be stated rather than inherited.
+
+python_design:
+  module: cordis.plugin
+  surface:
+    - "SCOPE_KEY: Final = \"__scope__\"   # CONFIG_KEY = \"config\", MOUNT_KEY = \"plugin\""
+    - "PluginTarget: TypeAlias = object"
+    - "def scope_of(ctx: Context) -> EffectScope: ..."
+    - "def config_of(ctx: Context) -> object: ..."
+    - "def normalise(target: object) -> PluginForm: ..."
+    - "@dataclass(frozen=True)\nclass PluginForm:\n    label: str\n    call: Callable[..., object]\n    arity: int\n    service: type[Service] | None = None"
+    - "class PluginHandle:"
+    - "    def plugin(self, target: PluginTarget, config: object = None, /, *, requires: tuple[str, ...] | None = None, isolate: Isolation = (), intercept: Interception | None = None, prepare: ConfigPreparer | None = None) -> PluginHandle: ..."
+    - "ConfigPreparer: TypeAlias = Callable[[Context, object], object]"
+    - "    def __await__(self) -> Generator[Any, None, PluginHandle]: ..."
+    - "    async def dispose(self) -> None: ..."
+    - "    @property\n    def context(self) -> Context: ..."
+    - "    @property\n    def scope(self) -> EffectScope: ..."
+    - "    @property\n    def state(self) -> FiberState: ..."
+    - "    @property\n    def error(self) -> BaseException | None: ..."
+    - "    @property\n    def children(self) -> tuple[PluginHandle, ...]: ..."
+    - "class PluginHost:"
+    - "    def __init__(self, registry: ServiceRegistry | None = None, *, label: str = \"root\") -> None: ..."
+    - "    @property\n    def root(self) -> PluginHandle: ..."
+    - "    async def dispose(self) -> None: ..."
+    - "class InvalidPluginError(CordisError): ...   # cordis.errors"
+  idioms:
+    - >-
+      Arity detection uses `inspect.signature` once per target, memoised in a
+      `WeakKeyDictionary` keyed by the target, so the `(ctx)` and
+      `(ctx, config)` forms cost nothing at mount time and a target that cannot
+      be weak-referenced (a bound method, most builtins) is simply re-inspected
+      rather than pinned in memory. Nothing is written *onto* the target: the
+      cache holds the form only, never the config — see PROP-PLUGIN-006.
+    - >-
+      Whether a target can be a key is decided by asking the cache, not by
+      inspecting the target's type: `WeakKeyDictionary.get` raises `TypeError`
+      for a key that cannot be weak-referenced *or* cannot be hashed, and both
+      answers mean the same thing here — re-inspect instead. Reading
+      `type(target).__weakrefoffset__` answers only the first half of that and
+      is a CPython implementation detail besides: PyPy has no such attribute,
+      where functions are weak-referenceable all the same, so the offset test
+      turned every mount on PyPy into an `AttributeError`.
+    - >-
+      A plugin module needs no framework import at runtime: `Context` is
+      imported under `TYPE_CHECKING` only, exactly as upstream uses a type-only
+      import.
+    - >-
+      `async def apply` is supported and awaited as part of reaching the
+      settled state, so a plugin that must do async setup does not need a
+      separate init hook.
+    - >-
+      What a body needs about itself rides the context tree's single
+      inheritance rule as scoped metadata rather than as new machinery: the
+      child context is extended with the instance's scope (`SCOPE_KEY`), its
+      config (`CONFIG_KEY`) and a *bound* mount callable (`MOUNT_KEY`), so
+      `scope_of(ctx)`, `ctx.config` and `ctx.plugin(...)` all resolve to the
+      nearest enclosing instance by the same lookup that realms use. The bound
+      callable is what makes SEM-002 hold for grandchildren: `ctx.plugin` is
+      `handle.plugin` of the instance that owns `ctx`, so a child cannot be
+      mounted on an ancestor even by capturing an outer `ctx`.
+    - >-
+      Each instance owns a private `nursery` sub-scope that its children's
+      scopes hang from, so disposing an instance's scope directly still takes
+      its children's scopes with it and nothing is stranded.
+  typing_notes:
+    - >-
+      `PluginTarget` is `object`, not a Protocol union. The four supported
+      forms have no common static shape a checker can express — a module and a
+      `Service` subclass share nothing — so a union would either be
+      unsatisfiable or force every caller into a cast. The narrowing is
+      `normalise`'s job and is checked at runtime, which is where an
+      unrecognised target actually arrives from (a config file, an entry point).
+    - >-
+      `IllegalTransitionError` is a plain `RuntimeError`, deliberately outside
+      the `CordisError` taxonomy: a bad state transition is a defect in this
+      package, not a condition an application should ever catch.
+  concurrency:
+    - >-
+      Mounting is synchronous up to the first await: `plugin()` validates,
+      builds the child, and calls the body before returning. A synchronous body
+      is therefore *complete* when the handle is returned, and no interleaving
+      of registry mutations is possible for it.
+    - >-
+      An async body is scheduled as one task per instance; awaiting the handle
+      awaits that task under `asyncio.shield`, so a cancelled *awaiter* does not
+      cancel the mount that other awaiters are also waiting on.
+    - >-
+      A body that raises before its first await still needs its acquisitions
+      released, which cannot happen synchronously because scope disposal is
+      async. The rollback is scheduled as the instance's task, so awaiting the
+      handle (or disposing it) waits for the rollback and then re-raises the
+      original exception.
+    - >-
+      `dispose()` is idempotent and concurrency-safe: the first caller stores
+      the unwind task and every later caller awaits that same task rather than
+      unwinding a second time.
+  deviations:
+    - >-
+      Amended by config-expressions: the mount API takes an optional
+      `prepare(ctx, raw) -> object`, called at the top of the load once the
+      instance's injections are bound and its isolation and interception are
+      applied, and before the raw config reaches either the schema or the body.
+      Such an instance builds its context twice — once for the preparer without
+      a config, once for the body with it — over one origin, so SEM-002 is read
+      as being about the context the body receives rather than about how many
+      were constructed to arrive at it.
+      It exists because "compute this config in the environment the instance
+      will actually run in" is not expressible any other way — the context does
+      not exist until the mount, and the config is part of the context. When a
+      preparer is given, config validation moves from the mount call to that
+      same moment and `update` compares raw values rather than resolved ones,
+      because a value that has not been computed cannot be validated or
+      compared. Without one, nothing about the mount path changes.
+    - >-
+      Amended by hot-reload: `PluginHandle.form` is public. The normalised form
+      is what an instance was built from, and "what is mounted here" is a
+      question the tree should be able to answer — hot reload asks it to find
+      the module an instance came from, and a diagnostic wanting the target's
+      identity rather than its label needs the same answer. It is read-only:
+      changing what an instance is means remounting it.
+    - >-
+      Upstream exposes mounting as `ctx.plugin(...)` on the context itself. Here
+      the owner of mount ordering and disposal is `PluginHandle`, and
+      `ctx.plugin` is a bound reference to it carried in scoped metadata. A
+      context is an immutable lookup node in this port; making it the owner of a
+      mutable child list would have given it a lifecycle it does not otherwise
+      have.
+    - >-
+      `PluginHost` has no upstream analogue. Upstream's root context is created
+      by the framework's own entry point; here the root handle, its scope, and
+      the registry it shares are explicit, so an application can own several
+      independent roots — which is what PROP-PLUGIN-001 needs in order to run
+      two permutations without shared state.
+    - >-
+      Disposal ordering (SEM-004) is enforced by the handle, not by the scope: a
+      scope's LIFO is flat and cannot express "descendants first, then my own
+      effects". `_unwind` disposes children in reverse mount order and only then
+      the instance's own scope.
+    - >-
+      Mounting on an instance that is already disposed raises `InactiveScopeError`
+      from the scope layer rather than a mounting-specific error. The condition
+      is "this scope is gone", and one error for it is better than two.
+    - >-
+      The mount frame carries a fourth key, `FIBER_KEY`, holding the instance
+      itself, with a `fiber_of(ctx)` reader beside `scope_of` and `config_of`.
+      Added while implementing logging (capability 12), where a record has to
+      name the instance that produced it: the frame already keeps the handle
+      alive through the bound `plugin` callable, so this costs one dict entry
+      and no reference, and the alternative — recovering the handle from that
+      callable's `__self__` — would make attribution depend on how the mount
+      frame happens to be spelled.
+
+properties:
+
+  - id: PROP-PLUGIN-001
+    claim: >-
+      Mounting a set of plugins in any permutation yields the same final set of
+      service bindings, listener registrations, and instance states.
+    shape: metamorphic
+    evidence: [SEM-006]
+    domain:
+      generates: >-
+        A set of 2-6 synthetic plugins with generated dependency relationships
+        forming a DAG, plus two independent permutations of the mount order.
+      excludes:
+        - Dependency cycles, which are specified to fail; covered separately
+          under dependency-injection.
+        - Bodies that resolve a dependency eagerly. Until declared injections
+          exist (capability 05), the only order-independent way to express a
+          dependency is late resolution — the generated bodies read the
+          registry when their service is *called*, not when it is mounted. A
+          body that resolved eagerly would fail for a reason this capability
+          does not yet own.
+      strategy_hint: >-
+        Generate a random DAG by drawing a topological rank per plugin and only
+        allowing edges from higher to lower rank, so validity is structural
+        rather than filtered.
+    preconditions: []
+    oracle:
+      kind: metamorphic
+      description: >-
+        Run the same plugin set under both permutations in fresh roots and
+        compare canonicalised snapshots of bindings, listener names, and
+        per-plugin state.
+      independence: >-
+        The two runs are independent executions whose only shared input is the
+        plugin set; agreement cannot be manufactured by a shared cache because
+        each run uses a fresh root.
+    failure_value: >-
+      Any state shared across mounts that the mount order can imprint on: a
+      registry, cache, or counter reached through a module global rather than
+      through the instance's own context, so the first permutation's bindings
+      are still visible to the second and the two runs disagree.
+    test_tier: pr
+    status: passing
+    test_id: >-
+      tests/test_plugin_mounting.py::test_mount_order_does_not_affect_the_final_state
+    notes: >-
+      RESTATED. The original failure value was "a plugin that reads a service in
+      its body instead of declaring it as an injection, which works when it is
+      mounted last and fails when the rows are reordered". Mutation testing
+      showed that value is unreachable through this capability's public surface:
+      it is a defect in *user* code, and at tier 1 there is no "declare an
+      injection" alternative to contrast it with — declared injections and the
+      PENDING state that defers a body until they resolve arrive with
+      dependency-injection (capability 05). Written as it stood, the card could
+      only be satisfied by a test that constructs the defect itself, which
+      proves nothing about the framework. The value above is the same guarantee
+      stated where this tier can falsify it, and it was verified by deliberate
+      mutation (one `ServiceRegistry` shared by every `PluginHost`, caught). The
+      original wording returns as a card under dependency-injection, where a
+      body that reads eagerly and a body that declares an injection are two
+      framework behaviours that can be compared.
+
+  - id: PROP-PLUGIN-002
+    claim: >-
+      After disposing a root, no service binding, listener, or resource created
+      anywhere in its plugin tree remains live.
+    shape: conservation
+    evidence: [SEM-002, SEM-004]
+    domain:
+      generates: >-
+        A nested plugin tree (depth 1-4, branching 1-3) where each plugin
+        provides services, registers listeners, and acquires ledger-tracked
+        resources.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Resource ledger balances to zero, registry binding view is empty, and
+        the event bus reports zero registered listeners.
+      independence: >-
+        Three separate observation surfaces, none of which is the plugin
+        tree's own bookkeeping; a handle that reports "disposed" while leaking
+        a listener still fails.
+    failure_value: >-
+      A plugin that mounts children on the *parent* context (a one-character
+      mistake: `ctx.parent.plugin` or a captured outer `ctx`), so its children
+      survive its own unload and keep serving stale state.
+    test_tier: local
+    status: passing
+    test_id: tests/test_plugin_mounting.py::test_disposing_a_root_leaves_nothing_live
+
+  - id: PROP-PLUGIN-003
+    claim: >-
+      Disposal proceeds strictly bottom-up: every descendant instance reaches
+      the disposed state before its ancestor's own effects begin unwinding.
+    shape: safety
+    evidence: [SEM-004]
+    domain:
+      generates: A nested plugin tree with an ordering probe registered at each level.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The probe log is checked against the tree structure recorded at build
+        time: for every parent/child pair, the child's probe index must be
+        lower than the parent's.
+      independence: >-
+        The tree structure comes from the generator's construction plan; the
+        probe order comes from runtime. Neither is produced by the disposal
+        traversal being tested.
+    failure_value: >-
+      Iterating children and parent effects in one flat reverse list, so a
+      parent's database handle is closed while a child's flush-on-dispose is
+      still writing through it.
+    test_tier: local
+    status: passing
+    test_id: tests/test_plugin_mounting.py::test_disposal_runs_strictly_bottom_up
+
+  - id: PROP-PLUGIN-004
+    claim: >-
+      A plugin whose body raises leaves every sibling and its parent fully
+      operational, and releases everything it had acquired before raising.
+    shape: safety
+    evidence: [SEM-007]
+    domain:
+      generates: >-
+        A sibling set of 1-6 plugins with a generated subset whose bodies raise
+        after acquiring a generated number of resources.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Non-failing siblings are in the active state with their bindings
+        resolvable; the failing plugins' resources show release_count == 1 and
+        their state is failed.
+      independence: >-
+        Sibling health is observed through the registry and through calling the
+        siblings' provided services, not through the mount handles that the
+        failure path also touches.
+    failure_value: >-
+      Letting the exception escape the mount call so it propagates into the
+      loader's task group and cancels the concurrent mounting of every other
+      row — one bad config field taking down the whole application.
+    test_tier: local
+    status: passing
+    test_id: tests/test_plugin_mounting.py::test_a_failing_plugin_leaves_its_siblings_operational
+
+  - id: PROP-PLUGIN-005
+    claim: >-
+      Any value that is not one of the supported plugin forms raises
+      InvalidPluginError and creates no context, scope, or binding.
+    shape: safety
+    evidence: [SEM-001]
+    domain:
+      generates: >-
+        Non-plugin values: ints, strings, dicts, classes without apply and not
+        deriving Service, objects whose `apply` is not callable, callables
+        taking zero or three or more required parameters, and generator and
+        async-generator functions of the right arity — including one reached
+        through `apply`, which is the shape that would otherwise slip past an
+        arity-only check.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Counts of live contexts, scopes, and bindings are identical before and
+        after the rejected mount.
+      independence: >-
+        Counts are read from public introspection surfaces distinct from the
+        mount path's own error handling.
+    failure_value: >-
+      Creating the child context and scope before validating the target, so
+      every rejected mount leaks a scope that nothing will ever dispose —
+      invisible until a config typo is retried in a reload loop.
+    test_tier: local
+    status: passing
+    test_id: tests/test_plugin_mounting.py::test_a_rejected_target_creates_nothing
+
+  - id: PROP-PLUGIN-006
+    claim: >-
+      Mounting the same target n times produces n instances whose contexts,
+      scopes, and configs are pairwise distinct.
+    shape: safety
+    evidence: [SEM-003]
+    domain:
+      generates: A single target plus 2-6 distinct config values.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Pairwise identity comparison of contexts and scopes, and equality of
+        each instance's observed config with the config it was mounted with.
+      independence: >-
+        Compares against the generator's config values, captured before the
+        mounts, so shared mutable default state is detected rather than masked.
+    failure_value: >-
+      Caching normalised plugin metadata on the target *including* the resolved
+      config, so the second mount of the same module silently runs with the
+      first mount's configuration.
+    test_tier: local
+    status: passing
+    test_id: tests/test_plugin_mounting.py::test_the_same_target_mounts_as_independent_instances
+
+  - id: PROP-PLUGIN-007
+    claim: >-
+      Awaiting a mount handle resolves only once the instance has settled, and
+      re-raises the body's exception when the body raised.
+    shape: safety
+    evidence: [SEM-005]
+    domain:
+      generates: Plugins whose bodies complete after a generated number of event-loop turns, with a generated subset raising generated exception types.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        At the moment the await resumes, the handle's state is settled, and for
+        raising bodies the propagated exception is the identical object the
+        body raised.
+      independence: >-
+        Exception identity is compared with `is` against the object the test's
+        plugin body constructed; no re-wrapping can satisfy it.
+    failure_value: >-
+      An awaited mount resolving as soon as the body's coroutine is scheduled,
+      so a startup script that awaits its plugins proceeds before they have
+      provided anything and every subsequent lookup fails intermittently.
+    test_tier: local
+    status: passing
+    test_id: tests/test_plugin_mounting.py::test_awaiting_a_mount_waits_for_it_to_settle
+
+  - id: PROP-PLUGIN-008
+    claim: >-
+      Mounting on an instance that has failed, is unloading, or is disposed
+      raises InactiveScopeError and adds no child, regardless of how many
+      event-loop turns have passed since it stopped being live.
+    shape: safety
+    evidence: [SEM-008]
+    domain:
+      generates: >-
+        An instance whose body succeeds or raises, awaited or not, observed
+        after 0-3 further event-loop turns; then a mount attempt on it after
+        disposal, and — for the raising case — on it immediately after failure.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        The attempt raises InactiveScopeError with operation "mount a plugin",
+        and the instance's children tuple is unchanged. The live case mounts
+        successfully in the same test, so refusing everything cannot pass.
+      independence: >-
+        The turn count and the settle/fail choices are the generator's, not the
+        implementation's; an answer that depends on scheduling disagrees with
+        itself across the generated cases rather than agreeing with a model
+        built the same way.
+    failure_value: >-
+      Deciding liveness by asking the scope instead of the state, so a mount
+      onto a just-failed parent is accepted for however many turns its rollback
+      takes to run: the child is built, its body runs and acquires resources,
+      and the parent's rollback then unwinds it — a plugin that appeared to
+      start and left no trace of why it is gone.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_plugin_mounting.py::test_mounting_into_an_instance_that_is_gone_is_refused
+
+open_questions:
+  - >-
+    DEFERRED: whether a plugin body should be allowed to be a plain async
+    generator (yielding once to mark "started", cleaning up after) as a fourth
+    form. It reads well in Python and subsumes the common acquire/release
+    plugin, but it adds a form to SEM-001 that upstream has no analogue for.
+    Deferred rather than decided because the same shape is already reachable
+    today — `ctx.scope.defer(...)` inside an ordinary body does exactly what the
+    generator's suffix would — so the form would be sugar, and sugar is worth
+    adding only once there is usage to shape it. Revisit after the declarative
+    loader (capability 14), which is where a generated body would most likely
+    be written. Nothing in the current implementation forecloses it: SEM-001
+    now rejects generator bodies explicitly, so accepting the yield-once form
+    later is a widening, not a change of meaning.
+  - >-
+    RESOLVED (implementation): a body that raises *before* its first await
+    still has to release what it acquired, and scope disposal is async, so the
+    release cannot happen inside the synchronous `plugin()` call. The rollback
+    is scheduled as the instance's own task; the instance is FAILED immediately
+    and the exception surfaces to whoever awaits the handle. A caller that
+    never awaits and never disposes will see the rollback complete on the next
+    loop turn regardless.
+  - >-
+    RESOLVED (implementation, SEM-008): mounting on an instance that is not
+    live raises `InactiveScopeError` rather than a mounting-specific error —
+    the condition is "this instance is gone", and one error for it is better
+    than two. Found by probing the implementation rather than by a test: a
+    just-failed instance accepted mounts for as long as its rollback took to be
+    scheduled, which SEM-008 and PROP-PLUGIN-008 now forbid. A supervisor that
+    wants to replace a failed child mounts the replacement on the *parent*,
+    which is where the failed instance itself was mounted.

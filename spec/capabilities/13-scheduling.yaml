@@ -1,0 +1,386 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: scheduling
+title: Scheduling — time-based work that unloads with its owner
+status: implemented
+tier: 2
+summary: >-
+  Timer, interval, throttle, debounce and background-task helpers that are
+  effects, so every scheduled callback and every spawned task is cancelled when
+  the plugin that created it unloads.
+
+problem:
+  statement: >-
+    Background work is where lifetime discipline breaks first. A plugin that
+    starts a polling loop or spawns a task and then unloads leaves the work
+    running against torn-down resources, and asyncio's default behaviour —
+    a task holding only a weak reference from the loop — makes the failure both
+    common and silent.
+  without_this:
+    - Unloading a plugin leaves its polling loop running, calling a service
+      that no longer exists.
+    - Reload multiplies background loops, so the tenth hot reload polls ten
+      times as often.
+    - Fire-and-forget tasks are garbage-collected mid-flight because nothing
+      holds a strong reference, producing intermittent, unreproducible loss.
+  rejected_alternatives:
+    - option: Tell plugin authors to use asyncio.TaskGroup themselves.
+      why_rejected: >-
+        A TaskGroup's lifetime is a lexical `async with` block, which does not
+        match a plugin body that returns while its work continues. The scope is
+        the right owner, not a block.
+    - option: A global scheduler service plugins submit jobs to.
+      why_rejected: >-
+        Reintroduces the ownership problem one level up: the scheduler must
+        then be told when to cancel, and telling it is the step authors forget.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/timer/src/index.ts
+      symbol: "ctx.timeout, interval, throttle, debounce, setTimeout, setInterval"
+    - repo: kb-docs
+      path: modular-software/cordis-cheatsheet.md
+      symbol: "§4.6 Timer plugin"
+
+depends_on: [effect-scope, plugin-mounting]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      Every scheduling helper registers as an effect on the calling scope and
+      returns a disposer; disposing the scope cancels the scheduled work.
+    rationale: The single rule the whole capability exists to enforce.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      After a scope is disposed, no callback scheduled through it is invoked,
+      including one whose deadline had already passed but which had not yet
+      run.
+    rationale: >-
+      "Already due but not yet dispatched" is the window where cancellation is
+      usually missed, and it is the window that produces use-after-teardown.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      `ctx.spawn(coro)` creates a task, holds a strong reference to it for its
+      lifetime, and cancels and awaits it on disposal; disposal does not return
+      until the task has actually finished.
+    rationale: >-
+      Both halves matter: without the strong reference the task may vanish;
+      without awaiting cancellation, teardown races the task's own cleanup.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      An exception raised by a scheduled callback or a spawned task is reported
+      on the error channel and does not cancel other scheduled work; a repeating
+      schedule continues after a failed iteration.
+    rationale: >-
+      A poller that stops forever after one transient network error is a
+      liveness bug that looks like nothing at all.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      A repeating schedule does not overlap itself: if an iteration is still
+      running when the next is due, the next is skipped and the skip is
+      counted.
+    rationale: >-
+      Overlap turns a slow iteration into unbounded concurrency, which is how a
+      polling plugin takes down the service it polls.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      `throttle(interval)` invokes at most once per interval and always
+      invokes with the most recent arguments seen in that interval;
+      `debounce(delay)` invokes once, `delay` after the last call.
+    rationale: >-
+      These two are routinely confused; specifying both together with their
+      argument semantics makes the difference testable rather than folkloric.
+
+  - id: SEM-007
+    kind: MUST
+    rule: >-
+      All scheduling reads time from an injectable clock; no helper calls a
+      wall-clock function directly.
+    rationale: >-
+      Time-dependent behaviour is otherwise testable only by sleeping, which
+      makes the test suite slow and flaky — and property-based testing of
+      scheduling requires driving time deterministically.
+
+python_design:
+  module: cordis.timer
+  surface:
+    - "@runtime_checkable\nclass Clock(Protocol):\n    def now(self) -> float: ...\n    async def sleep(self, seconds: float, /) -> None: ..."
+    - "class SystemClock:   # monotonic + asyncio.sleep; the fallback"
+    - "def clock_of(ctx: Context) -> Clock: ...   # the bound `clock` service, or SystemClock"
+    - "@dataclass(frozen=True)\nclass TimerFailure: label, error"
+    - "Report: TypeAlias = \"Callable[[TimerFailure], None]\""
+    - "def spawn(ctx, coro, /, *, label=None, on_error=None) -> EffectHandle: ..."
+    - "def timeout(ctx, delay: float, fn, /, *, on_error=None) -> EffectHandle: ..."
+    - "def interval(ctx, period: float, fn, /, *, on_error=None) -> Schedule: ..."
+    - "def throttle(ctx, period: float, fn: Callable[P, object], /, *, on_error=None) -> Callable[P, None]: ..."
+    - "def debounce(ctx, delay: float, fn: Callable[P, object], /, *, on_error=None) -> Callable[P, None]: ..."
+    - "class Schedule:   # the disposer, plus what the schedule actually did"
+    - "    completed: int; skipped: int; def __call__(self) -> Awaitable[None] | None: ..."
+  idioms:
+    - >-
+      The helpers are module-level functions taking a context, like `scope_of`,
+      `filter_of` and `logger` before them: `timeout(ctx, 5, fn)`. Upstream
+      spells them as context methods, which a Python context cannot offer
+      without making attribute resolution a special case.
+    - >-
+      The clock is a service, so tests provide a virtual clock by binding a
+      different one — the framework's own composition mechanism used on itself,
+      with no monkeypatching. Absent a bound clock, `SystemClock` is used, so a
+      caller that does not care about time never has to mount one.
+    - >-
+      `spawn` keeps the task in the closure it hands the effect record as a
+      disposer, which simultaneously satisfies SEM-003's strong reference and
+      makes the task visible in the diagnostics effect tree with its label.
+    - >-
+      `timeout` and `interval` are `spawn` with a body that sleeps: one
+      cancellation path, one strong-reference rule, one place where an
+      exception is contained. A separate `call_later` mechanism would have been
+      a second lifetime to get right.
+    - >-
+      `throttle` and `debounce` own at most one task at a time and register
+      exactly one effect, rather than spawning per call: a wrapper called a
+      thousand times must not leave a thousand effect records on the scope,
+      which is how a "cancel everything" that works in a test leaks in
+      production.
+  typing_notes:
+    - >-
+      `throttle`/`debounce` preserve the wrapped callable's ParamSpec, so
+      wrapping does not erase argument types.
+    - >-
+      `Clock` is `runtime_checkable`, so `clock_of` accepts any object with
+      `now` and `sleep` — including the tests' virtual clock, which knows
+      nothing about this module.
+  concurrency:
+    - >-
+      SEM-005's skip counter is per-schedule state mutated only from the
+      scheduling task, so it needs no lock.
+    - >-
+      Disposal cancels and then awaits: `task.cancel()` followed by an awaited
+      `gather(task, return_exceptions=True)`, so a task's own cleanup finishes
+      before dispose returns (SEM-003). The disposer is declared `async`, which
+      is how the effect layer already knows to await it rather than to call it
+      and move on.
+  deviations:
+    - >-
+      The error channel is the logging channel when there is one. SEM-004 says
+      failures are "reported on the error channel" without saying whose: here a
+      failure goes to the `on_error` callback if the call site passed one, else
+      to the bound `LoggerService` as an ERROR record, else to stderr as a
+      traceback. Routing to the logger puts a scheduled failure where an
+      operator is already looking, and it costs `cordis.timer` one import of
+      `cordis.logging` — a dependency running the same direction as every other.
+    - >-
+      `interval` returns a `Schedule` rather than a bare disposer: SEM-005
+      requires skips to be *counted*, and a count nobody can read is not a
+      count. `Schedule` disposes exactly like every other effect and carries
+      `completed` and `skipped` alongside.
+    - >-
+      A repeating schedule skips when the previous iteration is still running
+      at the deadline, and *not* when it finished exactly on it. SEM-005 says
+      "still running when the next is due"; treating equality as overlap would
+      make a job whose duration equals its period run every second period,
+      which is a surprising answer to a boundary that arises constantly under
+      virtual time.
+    - >-
+      `throttle` fires at the *end* of its window, carrying the last arguments
+      seen during it. SEM-006 asks for at most one call per interval with the
+      most recent arguments, and a leading-edge implementation cannot do both —
+      it fires before the most recent arguments exist. The cost is one
+      interval's latency on the first call, which is what throttling is.
+    - >-
+      A schedule's grid starts when its loop first runs, not when the call
+      returns. `interval` and `timeout` create a task, and a task's first line
+      runs at the next pass of the event loop, so the first deadline is
+      `period` after that pass rather than after the call. Under a real clock
+      the difference is a scheduling hop; under a virtual one it is visible,
+      and the tests drain the loop once before advancing time rather than
+      pretend otherwise. Making it exact would mean reading the clock in the
+      caller and passing an absolute deadline in — a second notion of "when
+      this started" for the sake of a hop nobody can observe in production.
+    - >-
+      A period of zero or less raises `ValueError` at the call, from `interval`,
+      `throttle` and `debounce` alike. The specification says nothing about it
+      because there is nothing to say: a zero period is a busy loop that
+      starves the event loop it runs on, and the call site is the only place
+      that still knows where the number came from.
+
+properties:
+
+  - id: PROP-TIMER-001
+    claim: >-
+      No callback scheduled through a scope is invoked after that scope is
+      disposed, for any interleaving of deadlines and disposal.
+    shape: safety
+    evidence: [SEM-001, SEM-002, SEM-007]
+    domain:
+      generates: >-
+        A set of timeouts, intervals and spawned tasks with generated delays,
+        plus a generated disposal time, all driven by a virtual clock advanced
+        in generated increments.
+      strategy_hint: >-
+        Include disposal times exactly equal to a deadline and one tick either
+        side, drawn explicitly rather than left to chance.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Callbacks and the disposal itself append to one timeline; every
+        callback entry must precede the disposal entry, and advancing the clock
+        far past every deadline afterwards must add nothing.
+      independence: >-
+        The timeline is the test's own list, appended to by the test's own
+        callbacks, and the disposal entry is written by the test at the moment
+        it disposes — none of it read from the scheduler's bookkeeping.
+    failure_value: >-
+      A due-but-not-yet-run callback firing after disposal, calling into a
+      service whose connection was already closed — the intermittent
+      "connection closed" error that appears only when a reload lands on a
+      timer boundary.
+    notes: >-
+      Oracle restated during implementation. It first read "every recorded time
+      must be strictly before the disposal time", which has no answer at the
+      boundary the card's own strategy hint insists on generating: a callback
+      due at exactly the disposal time runs *before* disposal and records
+      exactly that time, so a strict comparison fails a correct
+      implementation. Order in one shared timeline says what was meant --
+      nothing ran after the disposal -- and stays decidable at the tick where
+      it matters.
+    test_tier: local
+    status: passing
+    test_id: tests/test_timer.py::test_nothing_scheduled_runs_after_its_scope_is_gone
+
+  - id: PROP-TIMER-002
+    claim: >-
+      After disposing a scope, the number of live tasks it spawned is zero and
+      each was awaited to completion before dispose returned.
+    shape: conservation
+    evidence: [SEM-003]
+    domain:
+      generates: >-
+        Spawned coroutines with generated lifetimes, including ones that
+        swallow CancelledError for a bounded period before finishing.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Every spawned task reports `done()` at the moment `dispose()` returns,
+        and each task's own finally-block ran.
+      independence: >-
+        Uses asyncio's task state and the test's own finally-block markers,
+        neither controlled by the scheduler.
+    failure_value: >-
+      Cancelling without awaiting, so dispose returns while a task's cleanup is
+      still writing to a file the next reload is about to overwrite.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_timer.py::test_disposing_awaits_every_task_it_spawned
+
+  - id: PROP-TIMER-003
+    claim: >-
+      A repeating schedule never runs two iterations concurrently, and the
+      number of completed plus skipped iterations equals the number of
+      deadlines that elapsed.
+    shape: conservation
+    evidence: [SEM-005]
+    domain:
+      generates: An interval period plus a sequence of generated iteration durations, some exceeding the period.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        A test-local simulation over the generated durations computes the
+        expected completed and skipped counts; a concurrency counter asserts
+        the maximum observed in-flight count is 1.
+      independence: >-
+        The simulation is arithmetic over the generated durations and the
+        virtual clock, sharing no code with the scheduler.
+    failure_value: >-
+      Scheduling the next iteration on a fixed wall-clock grid without an
+      overlap guard, so a poller whose backend slows down builds up an
+      unbounded pile of concurrent requests and finishes the job of taking the
+      backend down.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_timer.py::test_a_schedule_never_overlaps_and_loses_no_deadline
+
+  - id: PROP-TIMER-004
+    claim: >-
+      Under any call pattern, throttle invokes at most once per interval with
+      the most recent arguments of that interval, and debounce invokes exactly
+      once per quiet period.
+    shape: differential
+    evidence: [SEM-006]
+    domain:
+      generates: A sequence of (virtual timestamp, argument) call events with generated gaps spanning below, at, and above the configured interval.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        Reference implementations of throttle and debounce written as pure
+        functions over the event list, producing the expected invocation list.
+      independence: >-
+        The reference is a ten-line fold over the generated events, written
+        from the definition rather than from the implementation.
+    failure_value: >-
+      A throttle that invokes with the *first* arguments of the interval rather
+      than the last, so a progress indicator or a state-sync call always
+      reports a stale value.
+    notes: >-
+      One card, two tests: `test_id` names the throttle half, and the debounce
+      half is
+      `tests/test_timer.py::test_debounce_fires_once_after_the_last_call_of_a_burst`.
+      Splitting them keeps each shrunk counterexample about one wrapper, which
+      is the difference between a failure that names its cause and one that has
+      to be re-read to find out which half broke.
+    test_tier: local
+    status: passing
+    test_id: tests/test_timer.py::test_throttle_fires_once_per_window_with_the_latest_arguments
+
+  - id: PROP-TIMER-005
+    claim: >-
+      A callback that raises does not stop its own repeating schedule and does
+      not affect any other scheduled work.
+    shape: safety
+    evidence: [SEM-004]
+    domain:
+      generates: Several schedules where a generated subset of iterations raise.
+    preconditions:
+      - At least one iteration raises; guaranteed by construction.
+    oracle:
+      kind: invariant
+      description: >-
+        Iteration counts for every schedule match the number of elapsed
+        deadlines regardless of which iterations raised, and each raised
+        exception appears once on the error channel.
+      independence: "The raising plan is the generator's; counts are observed externally."
+    failure_value: >-
+      A transient exception silently terminating a health-check loop, so the
+      system stops monitoring itself and nothing reports that it stopped.
+    test_tier: local
+    status: passing
+    test_id: tests/test_timer.py::test_a_raising_iteration_stops_nothing
+
+open_questions:
+  - >-
+    RESOLVED (start-based, with skipping). `interval` measures the period from
+    the start of the schedule: deadlines sit on the fixed grid
+    `start + n*period`, and a deadline that arrives while the previous
+    iteration is still running is skipped and counted. End-based scheduling was
+    tried against PROP-TIMER-003 as a mutant and the card caught it: with a
+    period of 1 and iterations lasting 2, an end-based schedule silently halves
+    its own frequency and reports nothing, while the start-based one runs half
+    as often *and says so* through `skipped`. The number a monitoring plugin
+    needs is "how many polls did I miss", and only one of the two can answer.

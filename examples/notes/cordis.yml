@@ -1,0 +1,29 @@
+# The application. Every row is one mounted plugin; `name` says where to find
+# it and `config` is what it gets. Order is not meaningful -- the writer and
+# the reporters wait for the store and the journal, whichever lands first.
+
+- id: journal
+  name: examples.notes.journal:Journal
+
+- id: store
+  name: examples.notes.providers:MemoryStore
+
+- id: writer
+  name: examples.notes.consumers:writer
+  config: { key: hello, text: the first note }
+
+- id: report
+  name: examples.notes.consumers:reporter
+  config: { label: main }
+
+# A group that resolves `store` privately: its reporter reads the store
+# mounted inside it, and neither sees nor is affected by the one outside.
+- id: sandbox
+  name: group
+  isolate: [store]
+  config:
+    - id: store
+      name: examples.notes.providers:MemoryStore
+    - id: report
+      name: examples.notes.consumers:reporter
+      config: { label: sandbox }

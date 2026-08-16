@@ -1,0 +1,382 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: context-tree
+title: Context tree — hierarchical scope, container handle, and identity
+status: implemented
+tier: 0
+summary: >-
+  A Context is a lightweight handle carrying a chain of scoped metadata and a
+  view onto the service registry; children are derived, never mutated into.
+
+problem:
+  statement: >-
+    Composable applications need per-subtree state (which tenant, which agent,
+    which realm) that is visible to descendants, invisible to siblings, and
+    impossible to leak upward — without threading a parameter through every
+    call or falling back to global singletons.
+  without_this:
+    - Plugins must accept and forward an explicit environment argument through
+      every internal call, so any missed forward silently reads the wrong scope.
+    - Per-subtree overrides (a test double, an isolated provider) require
+      mutating shared state, which races with concurrently loading siblings.
+    - There is no object to attach lifetime to, so registration and cleanup are
+      manual and drift apart.
+  rejected_alternatives:
+    - option: Python contextvars for all scoping.
+      why_rejected: >-
+        contextvars scope by execution context, not by composition structure.
+        A plugin that spawns a background task, or hands a callback to another
+        plugin, loses its scope; the Cordis model needs scope bound to the
+        object, so it survives being stored and called later.
+    - option: A single mutable global registry keyed by string paths.
+      why_rejected: >-
+        Makes child derivation O(n) string surgery, gives no natural disposal
+        boundary, and permits a child to overwrite a parent's entry.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/core/src/context.ts
+      symbol: "Context, Context.extend, Context.is"
+    - repo: cordis
+      path: packages/core/src/reflect.ts
+      symbol: "ReflectService.handler, isSpecialProperty"
+      note: >-
+        Upstream implements attribute resolution with a JS Proxy whose `get`
+        trap consults the reflect service; the pass-through list (symbols,
+        `prototype`, `then`, numeric strings, `_`-prefixed names) is the
+        boundary between "plain property" and "service lookup".
+    - repo: kb-docs
+      path: modular-software/cordis-cheatsheet.md
+      symbol: "§2.2 Context"
+
+depends_on: []
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      `ctx.extend(**meta)` returns a new Context whose scoped-metadata view is
+      the parent's view updated with `meta`; the parent's view is unchanged.
+    rationale: >-
+      Derivation, not mutation, is what makes concurrent sibling loading safe.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      Reading a scoped key not present in the child resolves to the nearest
+      ancestor that defines it; if no ancestor defines it and no service
+      provides it, resolution raises `ServiceNotFoundError` naming the key and
+      listing the contexts searched.
+    rationale: >-
+      Returning None turns a wiring mistake into a NoneType error thousands of
+      lines away.
+
+  - id: SEM-003
+    kind: MUST-NOT
+    rule: >-
+      Attribute names that are dunder, single-underscore-prefixed, or listed in
+      the reserved set MUST NOT be routed through service resolution; they
+      resolve as ordinary instance attributes.
+    rationale: >-
+      Protocol lookups (`__class__`, `__await__`, `__deepcopy__`) and internal
+      fields must never trigger a registry walk or a misleading error.
+    deviation:
+      upstream: >-
+        Upstream also passes through numeric-string keys and `then`, artefacts
+        of JS Proxy/thenable semantics.
+      rationale: >-
+        Python attribute names cannot be numeric, and awaitability is decided
+        by `__await__`, already covered by the dunder rule.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      Two Contexts derived from the same root MUST report the same `root`, and
+      `Context.is_context(obj)` MUST answer correctly for Contexts created by a
+      different import of the package.
+    rationale: >-
+      Duplicate module instances (editable installs, reloaders, vendored
+      copies) make `isinstance` unreliable; identity must be nominal.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      Deriving a child MUST be O(1) in the size of the inherited view and MUST
+      NOT copy ancestor metadata.
+    rationale: >-
+      Contexts are derived per mounted plugin and per dispatched event; copying
+      makes deep trees quadratic.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      A Context MUST be hashable and usable as a dict key for its whole life,
+      and equality MUST be identity equality.
+    rationale: >-
+      Registries key filters and scopes by context; value equality would fuse
+      two distinct scopes that happen to carry the same metadata.
+
+python_design:
+  module: cordis.context
+  surface:
+    - "class Context:"
+    - "    def extend(self, **meta: object) -> Context: ..."
+    - "    def get(self, token: type[T] | str, /) -> T | None: ..."
+    - "    def require(self, token: type[T] | str, /) -> T: ..."
+    - "    def __getattr__(self, name: str) -> Any: ..."
+    - "    @property\n    def root(self) -> Context: ..."
+    - "    @property\n    def label(self) -> str: ..."
+    - "    def lineage(self) -> Iterator[Context]: ..."
+    - "    @staticmethod\n    def is_context(obj: object) -> TypeGuard[Context]: ..."
+    - "class ServiceResolver(Protocol):\n    def lookup(self, name: str, /, *, ctx: Context) -> object | None: ...   # the seam the registry fills"
+  idioms:
+    - >-
+      `__getattr__` (not `__getattribute__`) does the resolution, so real
+      instance attributes and descriptors keep normal cost and semantics; the
+      resolver is only reached on a miss.
+    - >-
+      The scoped view is a parent pointer plus a small dict, walked on miss —
+      the same shape as `collections.ChainMap`, which is the reference model in
+      the differential property below.
+    - >-
+      `__slots__` on Context; a Context is allocated per plugin mount and per
+      scoped dispatch.
+    - >-
+      Nominal identity via a module-level sentinel attribute, mirroring the
+      upstream `Symbol.for('cordis.is')` brand.
+    - >-
+      The registry is reached through a `ServiceResolver` Protocol declared in
+      `cordis.context`, not by importing `cordis.registry` — the registry
+      depends on the context tree, so the dependency may only point one way.
+  typing_notes:
+    - >-
+      `__getattr__` returns `Any`, which is a typing escape hatch. It exists
+      for config-driven and dynamic access only. The *typed* path is
+      `ctx.require(ShellService) -> ShellService`, keyed by the service class,
+      which is the Python answer to TypeScript declaration merging and keeps
+      mypy --strict meaningful.
+    - >-
+      Classic `Generic[T]`/`TypeVar` syntax, not PEP 695, so the package stays
+      importable on PyPy 3.11.
+  concurrency:
+    - >-
+      Contexts are plain objects with no locks; all mutation of the shared
+      registry happens through the registry capability, never through a
+      Context.
+
+properties:
+
+  - id: PROP-CTX-001
+    claim: >-
+      Deriving any child context leaves every ancestor's scoped view exactly as
+      it was before the derivation.
+    shape: safety
+    evidence: [SEM-001]
+    domain:
+      generates: >-
+        A random tree of extend() operations (depth 1-6) over a small alphabet
+        of metadata keys and JSON-ish values, with an arbitrary node chosen as
+        the derivation point.
+      excludes:
+        - Reserved and underscore-prefixed keys, covered by PROP-CTX-004.
+      strategy_hint: >-
+        Build the tree directly with a recursive strategy over
+        (key, value, children) rather than generating operation lists and
+        filtering invalid ones.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Snapshot every node's resolved view as a plain dict before the
+        derivation, derive, then re-snapshot and compare.
+      independence: >-
+        The snapshot is taken by iterating declared keys and reading them, not
+        by calling the same internal view object the implementation mutates —
+        a shared-mutable-dict bug shows up as an equal-but-aliased snapshot
+        only if the snapshot is a deep copy, which the helper enforces.
+    failure_value: >-
+      An implementation that derives by `dict(parent_meta)` and then hands the
+      same dict to the child, so a later child write is visible to the parent
+      and to every sibling.
+    test_tier: local
+    test_id: tests/test_context_tree.py::test_deriving_a_child_leaves_every_ancestor_untouched
+    status: passing
+
+  - id: PROP-CTX-002
+    claim: >-
+      Resolving any key from any node of a context tree returns the same value
+      as looking that key up in a ChainMap of the node's ancestor metadata.
+    shape: differential
+    evidence: [SEM-001, SEM-002]
+    domain:
+      generates: >-
+        A context tree plus a query of (node, key) where the key is drawn from
+        the union of all keys used anywhere in the tree plus unused keys.
+      excludes:
+        - Service-provided names; this property covers scoped metadata only.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        `collections.ChainMap(*[node.own_meta for node in node_to_root])`
+        built by the test from the construction history, not from the Context.
+      independence: >-
+        ChainMap is stdlib and was not written against this specification; the
+        model is built from the recorded construction plan, so a bug in the
+        Context's own parent-walk cannot propagate into it.
+    failure_value: >-
+      A parent-walk that stops at the first node carrying *any* metadata rather
+      than the first node carrying *this key*, which silently shadows
+      grandparent values whenever an intermediate context adds an unrelated key.
+    test_tier: local
+    test_id: tests/test_context_tree.py::test_resolution_agrees_with_a_chainmap_of_the_lineage
+    status: passing
+
+  - id: PROP-CTX-003
+    claim: >-
+      For any two metadata mappings a and b, the view of
+      `ctx.extend(**a).extend(**b)` equals the view of `ctx.extend(**{**a, **b})`.
+    shape: metamorphic
+    evidence: [SEM-001]
+    domain:
+      generates: Two metadata mappings over a shared small key alphabet, with deliberate key overlap.
+      strategy_hint: >-
+        Draw keys from a fixed 4-symbol alphabet so overlap occurs often
+        instead of relying on chance over a large key space.
+    preconditions: []
+    oracle:
+      kind: metamorphic
+      description: >-
+        Compare the two resolved views directly; last write must win in both
+        orderings of construction. Both sides must additionally agree with the
+        plain dict merge `{**base, **a, **b}`.
+      independence: >-
+        The two sides are built by different code paths in the implementation
+        (two derivations vs one), so agreement is a real constraint rather than
+        a tautology. The dict-merge comparison is the independent model, and it
+        is not optional: see `notes`.
+    notes: >-
+      Amended after implementation. This card originally asserted only the
+      metamorphic equality of the two construction orders. Mutation testing
+      against the stated failure_value showed that a *symmetric* falsy-dropping
+      merge — one that discards `x=0` on every derivation path — satisfies the
+      metamorphic comparison, because both sides drop the same key. The card
+      claimed the two sides exercise different code paths; in the Python
+      implementation they share `extend`, so the claim only held for asymmetric
+      bugs. Comparing against `dict` restores the guarantee the card was
+      written to give.
+    failure_value: >-
+      A merge that treats falsy values as absent, so `extend(x=0)` fails to
+      shadow an inherited `x=1` — whether that happens on one construction path
+      or on both.
+    test_tier: local
+    test_id: tests/test_context_tree.py::test_chained_extends_equal_a_single_merged_extend
+    status: passing
+
+  - id: PROP-CTX-004
+    claim: >-
+      Reading a dunder, underscore-prefixed, or reserved attribute on a Context
+      never invokes the service resolver and never raises ServiceNotFoundError.
+    shape: safety
+    evidence: [SEM-003]
+    domain:
+      generates: >-
+        Attribute names sampled from Python's data-model dunders, plus
+        generated `_`-prefixed identifiers, plus the reserved set.
+      excludes:
+        - Names that exist as real attributes are still included; the assertion
+          is about the resolver never being called, not about success.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Install a counting spy on the resolver entry point; assert the counter
+        is unchanged and that any exception raised is AttributeError, never
+        ServiceNotFoundError.
+      independence: >-
+        The spy observes a different fact (was the resolver entered) than the
+        return value the implementation computes, so a resolver that happens to
+        return the right thing still fails the property.
+    failure_value: >-
+      `copy.deepcopy(ctx)` or `inspect.getmembers(ctx)` triggering a registry
+      walk for `__deepcopy__`, raising ServiceNotFoundError from inside stdlib
+      and making Contexts un-inspectable in a debugger.
+    test_tier: local
+    test_id: tests/test_context_tree.py::test_reserved_names_never_reach_the_resolver
+    status: passing
+
+  - id: PROP-CTX-005
+    claim: >-
+      Every context derived from a root reports that root, and identity-based
+      dict membership is stable across arbitrary further derivations.
+    shape: conservation
+    evidence: [SEM-004, SEM-006]
+    domain:
+      generates: A context tree plus a sequence of additional derivations performed after the contexts are stored in a dict.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Store every created context as a dict key, then after further
+        derivations assert each is still present and maps to its original
+        marker, and that `node.root is expected_root`.
+      independence: >-
+        Uses dict lookup semantics (hash + eq), a property of the object model
+        the implementation does not control, rather than re-reading the
+        implementation's own parent chain.
+    failure_value: >-
+      Defining `__eq__` for structural comparison without `__hash__`, making
+      Contexts unhashable, or worse, making two distinct scopes collide as one
+      registry key.
+    test_tier: local
+    test_id: tests/test_context_tree.py::test_root_and_dict_membership_survive_further_derivation
+    status: passing
+
+  - id: PROP-CTX-006
+    claim: >-
+      The metadata stored across a whole context tree is exactly the metadata
+      passed to the extend calls that built it, with each node storing only its
+      own contribution.
+    shape: conservation
+    evidence: [SEM-005]
+    domain:
+      generates: A context tree of arbitrary shape and depth.
+      strategy_hint: >-
+        Depth matters more than breadth here; a copying implementation is only
+        visibly wrong once a node has ancestors.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        Sum the sizes of the generated tree description's per-node metadata and
+        compare with the sum of `own_meta` sizes over the built contexts; then
+        assert each node's `own_meta` equals its spec node's metadata exactly.
+      independence: >-
+        Counting is done over the construction plan, which exists before any
+        Context does. An implementation that flattens ancestors into each child
+        still answers every read correctly, so no resolution-based oracle can
+        see it -- only the stored size can.
+    failure_value: >-
+      Deriving by `{**parent_view, **meta}`, which answers every lookup
+      correctly while making derivation O(n) in the inherited view and a deep
+      tree quadratic to build.
+    test_tier: local
+    test_id: tests/test_context_tree.py::test_a_child_stores_only_its_own_metadata
+    status: passing
+
+open_questions:
+  - >-
+    RESOLVED (implementation): `ctx.extend()` accepts any key and a scoped
+    value shadows a provided service of the same name, because resolution
+    consults the lineage before the resolver. Rejecting the collision here is
+    impossible without the context tree depending on the registry, which would
+    invert the tier order. DEFERRED to diagnostics (tier 2): the registry is
+    the side that knows both name sets, so the warning belongs there, raised
+    when a binding is provided for a name some live context already scopes.
+  - >-
+    `Context.label` is not in the original python_design surface. SEM-002
+    requires a failed resolution to list the contexts searched, which requires
+    contexts to be nameable; the label is a parent label plus a per-parent
+    counter, so it stays O(1) and reads as a position in the tree (`ctx.0.2`).

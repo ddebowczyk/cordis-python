@@ -1,0 +1,510 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: fiber-lifecycle
+title: Fiber lifecycle — the state machine of one mounted instance
+status: implemented
+tier: 1
+summary: >-
+  Each mounted plugin is a fiber with an observable state machine
+  (pending, loading, active, failed, unloading, disposed) whose transitions are
+  broadcast, making "why is nothing happening" answerable without a debugger.
+
+problem:
+  statement: >-
+    In a system where a plugin may legitimately be waiting for a dependency
+    that has not arrived, "loaded but doing nothing" and "broken" are different
+    conditions with different fixes — and both look identical from the outside
+    unless the runtime models and reports them.
+  without_this:
+    - A plugin waiting on a missing service is indistinguishable from a plugin
+      that crashed, so the first diagnostic step is always guesswork.
+    - There is no defined moment at which a plugin is "ready", so callers
+      either sleep or race.
+    - Reload, retry, and dependency-driven restart each invent their own ad hoc
+      notion of state and drift apart.
+  rejected_alternatives:
+    - option: A simple loaded/unloaded boolean.
+      why_rejected: >-
+        Cannot represent the pending state, which is the single most common
+        real-world condition and the one users most need explained.
+    - option: Exceptions for missing dependencies.
+      why_rejected: >-
+        Missing dependencies are normal and often transient; raising turns an
+        expected condition into an error the operator must suppress.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/core/src/fiber.ts
+      symbol: "Fiber, FiberState, Fiber._refresh, Fiber.restart, Fiber.await"
+    - repo: cordis
+      path: packages/core/src/events.ts
+      symbol: "internal/status"
+    - repo: kb-docs
+      path: modular-software/cordis-in-22-steps.md
+      symbol: "Step 5"
+
+depends_on: [plugin-mounting, effect-scope]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      A fiber is in exactly one of: PENDING, LOADING, ACTIVE, FAILED,
+      UNLOADING, DISPOSED.
+    rationale: Enumerated states are what make the transition table testable.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      The only permitted transitions are: PENDING->LOADING, LOADING->ACTIVE,
+      LOADING->FAILED, ACTIVE->UNLOADING, FAILED->UNLOADING,
+      PENDING->UNLOADING, UNLOADING->PENDING, UNLOADING->DISPOSED.
+      Any other transition is a defect.
+    rationale: >-
+      UNLOADING->PENDING is the reload edge: losing a dependency unloads back
+      to pending rather than to disposed, which is what makes provider swap
+      recover automatically.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      DISPOSED is terminal; a disposed fiber never transitions again and never
+      runs its plugin body again.
+    rationale: >-
+      Without a terminal state, a late dependency notification can resurrect a
+      fiber whose owner has already gone away.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      PENDING means at least one declared required dependency is unavailable.
+      A fiber MUST NOT sit in PENDING when all its declared dependencies are
+      available, and MUST NOT be ACTIVE when one is not.
+    rationale: >-
+      This biconditional is the contract users reason with; either direction
+      breaking produces a system that appears to work and then does not.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      Every transition emits exactly one status notification carrying the
+      fiber, the previous state, and the new state, after the new state is
+      observable on the fiber.
+    rationale: >-
+      A listener that reads `fiber.state` on notification must not see the old
+      value; ordering here is the difference between a usable dashboard and a
+      flickering one.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      `await fiber` resolves when the fiber reaches ACTIVE, PENDING, or
+      DISPOSED, and raises the startup exception if the fiber is FAILED.
+    rationale: >-
+      PENDING is settled, not transitional: awaiting a fiber whose dependency
+      may never arrive must not hang forever.
+
+  - id: SEM-007
+    kind: MUST
+    rule: >-
+      `fiber.restart()` performs a full unload followed by a fresh load; the
+      post-restart fiber shares no effects, listeners, or child instances with
+      the pre-restart one.
+    rationale: >-
+      Restart is the reuse point for reload, dependency swap, and config
+      change; if it shares anything, all three leak.
+
+  - id: SEM-008
+    kind: MUST
+    rule: >-
+      `fiber.update(config)` re-validates the config and, if it differs,
+      restarts the fiber; if it is equal, the fiber is left untouched and no
+      transition is emitted.
+    rationale: >-
+      Config files are re-read constantly. Restarting on an unchanged config
+      turns every file save into an unload storm.
+
+  - id: SEM-009
+    kind: MUST
+    rule: >-
+      Work the runtime schedules — awaiting an asynchronous body, releasing
+      what a failed body took, reloading after a dependency change — needs a
+      running event loop, but the operations that provoke it (mounting,
+      binding a service) do not. When there is no running loop, that work is
+      held, the fiber is not settled, and the work is performed at the fiber's
+      next awaited boundary. Mounting MUST NOT fail, and a binding MUST NOT be
+      lost, because no loop was running.
+    rationale: >-
+      Mounting is synchronous (plugin-mounting SEM-002) and bootstrap code
+      routinely runs before `asyncio.run`. If scheduling were mandatory, a
+      plugin whose body raises would succeed or explode depending on where the
+      caller happened to call it from, and a service bound during bootstrap
+      would leave its consumer PENDING forever with the dependency in plain
+      sight.
+    deviation:
+      upstream: >-
+        No analogue. JavaScript has exactly one event loop and it is always
+        there, so the question of scheduling without one cannot arise.
+      rationale: >-
+        Added during implementation, after mounting a failing body outside
+        `asyncio.run` scheduled its rollback onto a loop nobody was running.
+        Python's `asyncio.ensure_future` falls back to the current-thread loop
+        policy, which makes that failure silent — the work is created,
+        counted, and never run — so the rule is stated as an equivalence
+        between the two mount sites rather than as a permission.
+
+python_design:
+  module: cordis.fiber
+  surface:
+    - "class FiberState(enum.Enum): PENDING, LOADING, ACTIVE, FAILED, UNLOADING, DISPOSED"
+    - "TRANSITIONS: Final[Mapping[FiberState, frozenset[FiberState]]]"
+    - "SETTLED: Final[frozenset[FiberState]]   # PENDING, ACTIVE, FAILED, DISPOSED"
+    - "class IllegalTransitionError(RuntimeError): ..."
+    - "@dataclass(frozen=True)\nclass StatusChange:\n    fiber: Fiber\n    previous: FiberState\n    new: FiberState"
+    - "class Fiber:"
+    - "    @property\n    def state(self) -> FiberState: ..."
+    - "    @property\n    def requires(self) -> tuple[str, ...]: ..."
+    - "    @property\n    def missing(self) -> tuple[str, ...]: ...   # why it is PENDING"
+    - "    @property\n    def config(self) -> object: ..."
+    - "    async def restart(self) -> None: ..."
+    - "    async def update(self, config: object, /) -> None: ..."
+    - "    async def dispose(self) -> None: ..."
+    - "    def __await__(self) -> Generator[Any, None, Fiber]: ..."
+    - "    def effects(self) -> EffectNode: ..."
+    - "class FiberRuntime:   # the per-application clock and status channel"
+    - "    def observe(self, listener: Callable[[StatusChange], None]) -> Callable[[], None]: ..."
+    - "    def spawn(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]: ...   # raises without a running loop"
+    - "    async def quiesce(self) -> None: ...   # raises ExceptionGroup for listener faults"
+    - "    @property\n    def busy(self) -> bool: ..."
+    - "StatusListener: TypeAlias = Callable[[StatusChange], None]"
+  idioms:
+    - >-
+      The transition table is module-level data (`TRANSITIONS`) consulted by a
+      single `_transition()`, so the state-machine property imports the same
+      table as its model without importing the logic that uses it.
+    - >-
+      Settled-state waiting uses a single `asyncio.Event` re-armed on each
+      transition rather than per-waiter futures, so a fiber that flips
+      PENDING -> LOADING -> PENDING does not accumulate one future per flip.
+    - >-
+      Status notification is a synchronous observer list, in the shape the
+      service registry already uses (`observe(listener) -> unsubscribe`),
+      not an event-bus emit. SEM-005 is a statement about what a listener sees
+      *at the moment of* the transition; an awaited emit would put an
+      arbitrary number of turns between the assignment and the listener, and
+      "exactly one notification per transition" would then depend on the bus's
+      error handling. Diagnostics (capability 11) republishes this channel onto
+      the bus for consumers that want it there.
+    - >-
+      Readiness is recomputed from a registry `observe` subscription rather
+      than polled, and the recomputation is *scheduled* rather than run inline,
+      so a provider registering a service cannot recurse into a consumer's
+      reload while it is still mid-registration.
+    - >-
+      Scheduling goes through `asyncio.get_running_loop().create_task`, never
+      `ensure_future`. `ensure_future` falls back to the current-thread loop
+      policy, which in 3.12+ warns and can hand back a loop nobody is running:
+      the work would be created and counted and never start. The explicit
+      lookup turns that into a `RuntimeError` the one caller that can happen
+      to — a mount or a binding outside the loop (SEM-009) — handles by
+      holding the work.
+    - >-
+      A status listener that raises does not abort the transition announcing
+      it. The transition is often announced from a task nobody awaits, so
+      raising there would strand a fiber mid-state on someone else's bug. The
+      faults are collected and re-raised as an `ExceptionGroup` from
+      `quiesce()`, which is an awaited boundary with a caller to receive them.
+  typing_notes:
+    - >-
+      `Fiber` is not generic in its config type. A fiber's config arrives from
+      a config file or a loader row, so the only honest static type at the
+      mount site is `object`; making the class generic would put a type
+      parameter on every internal reference in exchange for a guarantee the
+      call site cannot actually supply. Config validation (capability 07) is
+      where a config becomes a typed value, and it types the *body's*
+      parameter, which is where the type is used.
+  concurrency:
+    - >-
+      A restart triggered while a restart is in flight coalesces: the second
+      request does not start a third body, it ensures one more reload happens
+      after the current one settles.
+    - >-
+      `dispose()` during LOADING waits for the body to finish or be cancelled
+      before unwinding, never unwinds concurrently with setup.
+    - >-
+      Awaiting a fiber waits for a scheduled re-evaluation as well as for a
+      load or unload, even though the state it is waiting in (PENDING) is
+      settled. Resolving at a PENDING the runtime is about to leave would
+      report a dependency missing that is already bound.
+    - >-
+      "Quiescent" is a defined moment, not a heuristic sleep: `quiesce()`
+      returns when no fiber has a load, unload, or scheduled re-evaluation
+      outstanding. The properties that sample state at quiescence use it, so a
+      slow body cannot make a test flaky and a missing wake-up cannot make one
+      pass.
+  deviations:
+    - >-
+      `Fiber` is the base class of `cordis.plugin.PluginHandle` rather than a
+      separate object beside it: one mounted instance has one state machine,
+      and two objects sharing it would need a synchronisation rule nothing else
+      in the system has. `cordis.fiber` owns the state machine, the settle
+      protocol, disposal ordering and readiness; `cordis.plugin` supplies what
+      only it knows — how to turn a target into a body and how to build the
+      child environment that body runs in. The dependency stays one-way
+      (plugin -> fiber), which is why the enum could land with capability 03.
+    - >-
+      Upstream broadcasts transitions as an `internal/status` event on the
+      event bus. Here the fiber's own channel is synchronous (see idioms) and
+      the bus event is a republication built on top of it.
+    - >-
+      A fiber's required dependencies are given to it as a `requires` tuple of
+      names. *How* a plugin declares them — a module-level `inject` attribute,
+      a class attribute, a decorator — belongs to dependency-injection
+      (capability 05), which normalises any of those spellings into this same
+      tuple. Splitting it this way keeps the biconditional of SEM-004 testable
+      at this tier without pre-empting 05's surface, and means 05 adds a
+      declaration reader rather than a second lifecycle.
+    - >-
+      Added while implementing diagnostics (capability 11): `Fiber.uid`, a
+      process-wide serial assigned at construction. Nothing in this capability
+      needs it — a fiber knows itself by being itself — but a diagnostic
+      snapshot outlives the fiber it describes, and `id()` is unique only among
+      live objects, the same trap `Fiber._sample` already avoids by holding
+      objects rather than their addresses. The field lives here because this is
+      where instances are created; the reasoning is recorded in
+      `11-diagnostics.yaml`.
+
+properties:
+
+  - id: PROP-FIBER-001
+    claim: >-
+      Every observed state transition of every fiber is a member of the
+      declared allowed-transition table.
+    shape: state-machine
+    evidence: [SEM-001, SEM-002, SEM-003]
+    domain:
+      generates: >-
+        A Hypothesis RuleBasedStateMachine issuing mount, dispose, restart,
+        update, provide-dependency and remove-dependency rules against a live
+        root, with fibers held in a bundle.
+      excludes:
+        - Direct manipulation of internal state; only public operations are
+          issued.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        A status listener records (prev, next) for every transition; each pair
+        must be in `TRANSITIONS`, and no pair may originate from DISPOSED.
+      independence: >-
+        The allowed-transition table is declarative data reviewed against the
+        specification, and the observed pairs come from the notification
+        stream, which is emitted by a different code path than the guard the
+        table would be used for.
+    failure_value: >-
+      A dependency notification arriving after disposal and driving a
+      DISPOSED->LOADING transition, re-running a plugin body whose owner is
+      gone and re-registering listeners into a dead scope.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_fiber_lifecycle.py::test_every_transition_is_permitted
+
+  - id: PROP-FIBER-002
+    claim: >-
+      At every quiescent point, a fiber is ACTIVE if and only if all of its
+      declared required dependencies are currently bound.
+    shape: state-machine
+    evidence: [SEM-004]
+    domain:
+      generates: >-
+        The same state machine as PROP-FIBER-001, with dependency
+        provide/remove rules weighted to produce frequent availability flips.
+    preconditions:
+      - Checked only after the runtime reports quiescence, so in-flight
+        transitions are not sampled.
+    oracle:
+      kind: model
+      description: >-
+        The test maintains its own set of currently-provided names from the
+        rules it issued, and compares `all(dep in provided)` against
+        `fiber.state is ACTIVE` for every fiber.
+      independence: >-
+        The provided-name set is the test's own record of the operations it
+        performed; it never reads the registry, so a registry bug cannot make
+        both sides agree.
+    failure_value: >-
+      Recomputing readiness only on provide and not on removal, leaving a fiber
+      ACTIVE and happily calling a service that was unloaded — the stale-handle
+      crash that provider swap is supposed to make impossible.
+    test_tier: pr
+    status: passing
+    test_id: >-
+      tests/test_fiber_lifecycle.py::test_active_exactly_when_dependencies_are_bound
+
+  - id: PROP-FIBER-003
+    claim: >-
+      Restarting a fiber leaves the ledger balance of its resources unchanged
+      relative to before the restart, and shares no disposer identity across
+      the restart boundary.
+    shape: conservation
+    evidence: [SEM-007]
+    domain:
+      generates: A fiber whose body acquires a generated number of resources and registers a generated number of listeners, restarted 1-5 times.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Net live-resource count after each restart equals the count after the
+        first load; the set of disposer object ids before and after a restart
+        is disjoint.
+      independence: >-
+        Object-id disjointness is a fact about allocation the implementation
+        cannot fake while still reusing state; the ledger is external.
+    failure_value: >-
+      A restart that reuses the existing effect scope to "save allocation", so
+      each reload doubles the listener count — the classic HMR leak where the
+      tenth save handles every event ten times.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_fiber_lifecycle.py::test_restart_conserves_resources_and_shares_nothing
+
+  - id: PROP-FIBER-004
+    claim: >-
+      Updating a fiber with a config equal to its current config performs no
+      transition and emits no status notification.
+    shape: idempotency
+    evidence: [SEM-008]
+    domain:
+      generates: >-
+        A config value plus a semantically-equal but not identical copy
+        (round-tripped through serialisation, dict re-ordered, tuples vs lists
+        where the schema treats them alike).
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        The captured transition log is empty across the update, and resource
+        object identity is preserved.
+      independence: >-
+        Observed through the notification stream and object identity, both
+        external to the equality check being exercised.
+    failure_value: >-
+      Comparing configs by object identity rather than value, so re-reading an
+      unchanged YAML file restarts every plugin in the tree on every save.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_fiber_lifecycle.py::test_updating_with_an_equal_config_changes_nothing
+
+  - id: PROP-FIBER-005
+    claim: >-
+      Awaiting a fiber always resolves or raises within a bounded number of
+      event-loop turns after the system quiesces, and never resolves while the
+      fiber is LOADING or UNLOADING.
+    shape: safety
+    evidence: [SEM-006]
+    domain:
+      generates: >-
+        Fibers whose bodies complete after a generated number of turns, a
+        subset raising, and a subset declaring dependencies that are never
+        provided.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        The awaiting task records the fiber's state at the moment it resumed;
+        that state must be in {ACTIVE, PENDING, DISPOSED} or the await must
+        have raised.
+      independence: >-
+        The observation is made by a separate task reading the public state at
+        resume time, not by the code that decides when to wake waiters.
+    failure_value: >-
+      Awaiting a fiber whose dependency never arrives hanging forever, so a
+      startup script that awaits its plugins blocks indefinitely on a
+      misconfigured deployment instead of reporting which service is missing.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_fiber_lifecycle.py::test_awaiting_a_fiber_always_settles
+
+  - id: PROP-FIBER-006
+    claim: >-
+      For every transition notification, reading `fiber.state` inside the
+      listener returns the notification's `new` value.
+    shape: safety
+    evidence: [SEM-005]
+    domain:
+      generates: Any operation sequence from the PROP-FIBER-001 state machine.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        The listener asserts `fiber.state is event.new` for every notification
+        it receives.
+      independence: >-
+        Compares two surfaces the implementation must keep in sync — the
+        payload it constructs and the attribute it writes — so publishing
+        before assigning is detected.
+    failure_value: >-
+      Emitting the notification before assigning the new state, so a dashboard
+      or a dependency tracker built on the event stream is always one
+      transition behind and reacts to conditions that no longer hold.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_fiber_lifecycle.py::test_the_new_state_is_readable_when_the_notification_arrives
+
+  - id: PROP-FIBER-007
+    claim: >-
+      A fiber mounted, and its dependencies bound, before any event loop is
+      running settles in the same state, raises the same failure, and leaves
+      the same resource ledger as the identical fiber mounted inside a running
+      loop.
+    shape: metamorphic
+    evidence: [SEM-009]
+    domain:
+      generates: >-
+        A body that acquires a resource and then either returns, awaits and
+        returns, or raises, with a generated set of declared dependencies that
+        are bound after the mount.
+      excludes:
+        - Bodies that observe the loop directly; the claim is about the
+          runtime's scheduling, not about what a body may legally do.
+    preconditions:
+      - The two runs are separate hosts with separate registries, so neither
+        can see the other's bindings.
+    oracle:
+      kind: metamorphic
+      description: >-
+        Both runs return a tuple of (final state, exception type or None,
+        ledger acquire/release trace); the tuples must be equal.
+      independence: >-
+        Neither side is a model of the other: the same production code runs
+        both times and only the mount site moves, so an equal result cannot be
+        arranged by a shared shortcut the way a hand-written expectation can.
+    failure_value: >-
+      Scheduling through `asyncio.ensure_future`, which falls back to a policy
+      loop nobody runs: a failing body's resources are never released and the
+      fiber never settles, so a program that mounts during bootstrap hangs on
+      its first await for reasons invisible in the plugin.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_fiber_lifecycle.py::test_mounting_before_the_loop_starts_settles_the_same_way
+
+open_questions:
+  - >-
+    RESOLVED (implementation): FAILED is not automatically retryable on a
+    dependency change. `_evaluate` reloads only from PENDING and unloads only
+    from ACTIVE, so a failed fiber stays failed until `restart()`. Upstream's
+    default, kept for its reason: a body that failed may have failed *because*
+    of what it saw, and retrying it on every binding flip turns one bad config
+    into an unbounded restart loop. `restart()` is the explicit retry, and
+    capability 11 is where a supervisor policy would live if one is wanted.
+  - >-
+    RESOLVED (implementation): whether a fiber may be mounted before the event
+    loop exists. It may -- see SEM-009 and PROP-FIBER-007. The held work is
+    per-fiber rather than per-runtime because a fiber's own awaited boundary
+    is the only place the ordering against its `_task` is unambiguous.

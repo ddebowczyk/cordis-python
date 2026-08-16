@@ -1,0 +1,110 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly property campaigns: longer runs against fresh entropy.
+    - cron: "0 3 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  spec:
+    name: capability catalog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      # The schema is JSON Schema 2020-12 written in YAML. Validated with the
+      # same command `just spec-check` runs, so a catalog that passes locally
+      # passes here for the same reason.
+      - name: Validate every capability against the versioned schema
+        run: uvx check-jsonschema --schemafile spec/schema/capability.v1.yaml spec/capabilities/*.yaml
+      - name: Cross-file consistency and property coverage
+        run: uv run spec/check_spec.py
+
+  gate:
+    name: lint and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv sync --all-extras
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      # A renamed export must not leave the reference describing the old name.
+      - run: uv run docs/build_reference.py --check
+
+  package:
+    name: wheel and sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv build
+      # Pure Python is a promise the matrix keeps and this step states: one
+      # artefact for every interpreter, PyPy included.
+      - name: The wheel is py3-none-any
+        run: ls dist/ | grep -q -- '-py3-none-any\.whl$'
+      # The catalog is the contract the tests are generated from, so a fork
+      # gets the spec and not just the code.
+      - name: The sdist carries the capability catalog
+        run: tar -tzf dist/*.tar.gz | grep -q 'spec/capabilities/00-context-tree.yaml'
+      - name: Metadata is renderable
+        run: uvx twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+
+  test:
+    name: tests (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # PyPy is in the matrix to hold the package to pure Python. If a change
+        # needs a C extension or a CPython implementation detail, this job is
+        # where that decision surfaces -- before it ships, not after.
+        python: ["3.11", "3.12", "3.13", "pypy3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv python install ${{ matrix.python }}
+      - run: uv sync --all-extras --python ${{ matrix.python }}
+
+      # Restore the shrunk counterexamples found by earlier runs so a failure
+      # discovered once is replayed on every run afterwards, not rediscovered
+      # by chance.
+      - name: Restore Hypothesis example database
+        uses: actions/cache/restore@v4
+        with:
+          path: .hypothesis/examples
+          key: hypothesis-${{ matrix.python }}-${{ github.run_id }}
+          restore-keys: hypothesis-${{ matrix.python }}-
+
+      - name: Run property tests
+        env:
+          HYPOTHESIS_PROFILE: ${{ github.event_name == 'schedule' && 'nightly' || 'pr' }}
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            uv run pytest
+          else
+            uv run pytest -m "not tier_release"
+          fi
+
+      - name: Save Hypothesis example database
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .hypothesis/examples
+          key: hypothesis-${{ matrix.python }}-${{ github.run_id }}

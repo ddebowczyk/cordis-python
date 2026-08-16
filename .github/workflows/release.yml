@@ -1,0 +1,81 @@
+name: release
+
+# Publishing is what a tag means. Everything the tag claims is re-checked
+# first: a green CI run on `main` is not evidence about the commit that was
+# tagged, and the artefact that reaches PyPI is the one this job built.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv sync --all-extras
+      - name: Capability catalog
+        run: |
+          uvx check-jsonschema --schemafile spec/schema/capability.v1.yaml spec/capabilities/*.yaml
+          uv run spec/check_spec.py
+      - name: Lint, types, generated docs
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run mypy
+          uv run docs/build_reference.py --check
+      # A release runs the exhaustive tier: the campaigns that are too long for
+      # a pull request are exactly the ones worth running before publishing.
+      - name: Property tests, release tier
+        env:
+          HYPOTHESIS_PROFILE: release
+        run: uv run pytest
+
+  build:
+    name: build
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv build
+      - name: The tag and the package agree
+        run: |
+          version="$(uv run python -c 'import cordis; print(cordis.__version__)')"
+          tag="${GITHUB_REF_NAME#v}"
+          test "$version" = "$tag" || {
+            echo "tag $tag does not match cordis.__version__ $version" >&2
+            exit 1
+          }
+      - name: The wheel is py3-none-any
+        run: ls dist/ | grep -q -- '-py3-none-any\.whl$'
+      - name: The sdist carries the capability catalog
+        run: tar -tzf dist/*.tar.gz | grep -q 'spec/capabilities/00-context-tree.yaml'
+      - run: uvx twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # Trusted publishing: no API token lives in this repository. Configure the
+    # publisher once at https://pypi.org/manage/account/publishing/ for
+    # project `cordis-python`, workflow `release.yml`, environment `pypi`.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

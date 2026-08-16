@@ -1,0 +1,377 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: scoped-registration
+title: Scoped registration — per-subject contributions in one process
+status: implemented
+tier: 3
+summary: >-
+  A pattern layered on context tagging and event filtering in which the context
+  a contribution is registered from determines both who can see it and how long
+  it lives, so many live subjects (sessions, agents, tenants) share one plugin
+  tree without seeing each other's contributions.
+
+problem:
+  statement: >-
+    Isolation realms are static: they are decided by configuration when the
+    tree is built. Live subjects are dynamic — sessions start and end, agents
+    spawn sub-agents — and each needs its own registrations in shared
+    registries without a separate plugin tree per subject.
+  without_this:
+    - One process per subject, which forfeits shared warm state and multiplies
+      memory by the number of concurrent subjects.
+    - Or a single shared registry where every entry carries a subject id and
+      every consumer filters, which leaks the moment one consumer forgets.
+    - Subject teardown becomes a manual sweep of every registry, and anything
+      missed leaks for the process lifetime.
+  rejected_alternatives:
+    - option: Use isolation realms per subject.
+      why_rejected: >-
+        Realms are keyed by service name and created structurally; creating one
+        per live subject conflates a configuration concept with a runtime one
+        and gives no filtering of events, only of resolution.
+    - option: Pass a subject id explicitly through every API.
+      why_rejected: >-
+        Correct but viral: every signature in the system acquires the parameter
+        and every implementation must be trusted to honour it.
+
+origin:
+  references:
+    - repo: deepseek-harness
+      path: packages/core/scope/src/index.ts
+      symbol: "createScope, scopeOf, scopeTarget, bindScopeParent"
+    - repo: deepseek-harness
+      path: packages/core/agent-loop/src/agent.ts
+      symbol: "this.scope = createScope(loopCtx, this)"
+    - repo: kb-docs
+      path: modular-software/cordis-cheatsheet.md
+      symbol: "§5.3 Scoped registration"
+
+depends_on: [context-tree, event-filtering, plugin-mounting, effect-scope]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      `create_scope(ctx, key)` mounts a lifetime-owning plugin and returns a
+      scope whose context carries `key`; disposing the scope unwinds every
+      registration made through that context.
+    rationale: >-
+      The lifetime owner must be a real mounted instance, so subject teardown
+      uses the same machinery as every other unload.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      Registration visibility inherits DOWN the scope chain: a contribution
+      registered at scope S is visible to S and to every scope created from S,
+      and to no other scope.
+    rationale: >-
+      A sub-agent must see what its parent contributed; a sibling must not.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      Event admission extends UP the scope chain: an event dispatched with
+      carrier scope S is admitted to listeners registered at S and at every
+      ancestor of S.
+    rationale: >-
+      Deliberately the opposite direction from visibility. A parent supervising
+      a sub-agent must hear its events; the sub-agent must not hear its
+      siblings'. Getting this backwards is the defining bug of the pattern.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      A contribution registered from an unscoped context is visible to every
+      scope.
+    rationale: >-
+      Globally available capabilities — the built-in tools, the base prompt —
+      must not need a scope, and the absence of a key must mean "everywhere",
+      not "nowhere".
+
+  - id: SEM-005
+    kind: MUST-NOT
+    rule: >-
+      Scoping MUST NOT be relied on as a security or trust boundary. Only
+      scope-aware APIs isolate; anything reachable through the registry remains
+      reachable from any context.
+    rationale: >-
+      Stated explicitly because the mechanism looks like isolation and will be
+      mistaken for it otherwise. The harness documents the same caveat.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      Disposing a scope disposes its descendant scopes first, and a subject's
+      teardown is complete when its scope's disposal returns.
+    rationale: >-
+      "Complete" must be a moment a caller can await, or session cleanup races
+      session creation.
+
+  - id: SEM-007
+    kind: MUST
+    rule: >-
+      A registry that participates in scoping filters its query results by the
+      querying context's scope and applies no filtering for unscoped queries
+      that request the unfiltered view explicitly.
+    rationale: >-
+      The unfiltered view is needed by diagnostics and by the session recorder;
+      making it explicit keeps accidental global reads visible in review.
+
+python_design:
+  module: cordis.scope
+  surface:
+    - "SUBJECT_KEY: Final = \"__subject__\""
+    - "class Scope:\n    key: object\n    ctx: Context\n    parent: Scope | None\n    label: str"
+    - "    def lineage(self) -> Iterator[Scope]: ...   # self first, then ancestors"
+    - "    def covers(self, other: Scope | None, /) -> bool: ...   # self is `other` or an ancestor of it"
+    - "    async def dispose(self) -> None: ..."
+    - "def create_scope(ctx: Context, key: object, /, *, label: str | None = None) -> Scope: ..."
+    - "def subject_of(ctx: Context, /) -> Scope | None: ..."
+    - "def scope_target(base: Context, scope: Scope | None, /) -> Context: ..."
+    - "def admits(listener: Scope | None, carrier: Scope | None, /) -> bool: ..."
+    - "class ScopedRegistry(Generic[T]):\n    def register(self, item: T, /, *, ctx: Context, label: str | None = None) -> EffectHandle: ...\n    def visible(self, *, ctx: Context) -> tuple[T, ...]: ...\n    def all(self) -> tuple[T, ...]: ..."
+  idioms:
+    - >-
+      `create_scope` mounts a no-op plugin purely to own the lifetime, then
+      extends that fiber's context with the scope key — exactly the harness's
+      construction, because the alternative (a bare context) has no disposal
+      hook.
+    - >-
+      `ScopedRegistry` is a concrete generic base class rather than a pattern
+      to reimplement per registry; every scoped registry in an application
+      subclasses it, so SEM-002 and SEM-003 are implemented once.
+    - >-
+      Registration is an effect on the registering context's own effect scope,
+      so the caller's fiber owns the removal and a registration made through a
+      scope context is unwound by that scope's disposal without the registry
+      knowing anything about scopes' lifetimes.
+    - >-
+      The two directions are one predicate used twice. Visibility asks
+      "does the registrant's scope cover the querier's?"; event admission asks
+      "does the listener's scope cover the carrier's?". Both are `covers`,
+      which is why the sign error PROP-SCOPE-002 names cannot be made in one
+      place and not the other.
+  typing_notes:
+    - >-
+      `Scope.key` is `object` and compared by identity; the subject itself is
+      the natural key, which keeps the scope and its subject from drifting.
+    - >-
+      `ScopedRegistry` is `Generic[T]` with an explicit `TypeVar`, not PEP 695
+      class syntax: the floor is Python 3.11.
+  concurrency:
+    - >-
+      Scope creation and disposal are ordinary mounts and unloads, so they
+      inherit the fiber lifecycle's concurrency guarantees.
+  deviations:
+    - >-
+      The reader is `subject_of(ctx)`, not `scope_of(ctx)` as the record first
+      wrote it. `cordis.plugin.scope_of` already names a context's `EffectScope`
+      and has the same signature; two readers with one name resolving to two
+      different objects is precisely the hazard that made every reader in this
+      port a module-level function in the first place.
+    - >-
+      `create_scope` composes with the filter already in force rather than
+      replacing it, even though `10-event-filtering` says a nearer filter
+      replaces. That rule is about filters an author installs deliberately;
+      this one is installed on the author's behalf by scope creation, and
+      replacing theirs would silently widen admission for a whole subtree. The
+      composition is an `and`, so a scope can only ever narrow.
+    - >-
+      The scope tree is the fiber tree. `create_scope` mounts its owner under
+      the current fiber, so a child scope is a descendant fiber of its parent
+      scope's owner, and SEM-006 — descendants first, completion awaitable —
+      is inherited from fiber disposal rather than reimplemented. The
+      consequence is that `Scope.parent` and the mount chain cannot disagree.
+    - >-
+      `register` returns an `EffectHandle` rather than a bare `Disposer`: it is
+      what every other registration in this port returns, and it is what makes
+      the registration appear in the effect tree that `11-diagnostics` renders.
+    - >-
+      `Scope` carries a `label` and appears in the effect and fiber trees under
+      it. A scope is a lifetime an operator has to be able to find, and the
+      key — the session object itself — has no useful `repr` in general.
+
+properties:
+
+  - id: PROP-SCOPE-001
+    claim: >-
+      A contribution registered at scope S is visible from S and its
+      descendants, and from nowhere else.
+    shape: differential
+    evidence: [SEM-002, SEM-004]
+    domain:
+      generates: >-
+        A scope tree (depth 1-5) with contributions registered at generated
+        scopes including the unscoped root, plus queries from every scope.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        Expected visibility computed by the test as "registrant is the querier
+        or an ancestor of it, or the registrant is unscoped".
+      independence: >-
+        Ancestry is read from the generator's own scope tree, not from the
+        runtime's chain.
+    failure_value: >-
+      Visibility computed as "same scope only", so a sub-agent silently loses
+      every tool its parent registered and the failure looks like a missing
+      capability rather than a scoping bug.
+    test_tier: local
+    status: passing
+    test_id: tests/test_scope.py::test_a_contribution_is_visible_down_the_scope_chain_and_no_further
+
+  - id: PROP-SCOPE-002
+    claim: >-
+      An event carried by scope S reaches listeners registered at S and at
+      every ancestor of S, and no listener registered at a non-ancestor scope.
+    shape: differential
+    evidence: [SEM-003]
+    domain:
+      generates: A scope tree with listeners at generated scopes and a generated carrier scope.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        Expected admission computed by the test as "listener scope is the
+        carrier or an ancestor of it, or the listener is unscoped or global".
+      independence: "Ancestry from the generator's tree."
+    failure_value: >-
+      Admission computed downward instead of upward, so a supervisor never sees
+      its sub-agent's events while every sibling session sees them — a
+      correctness bug and a data-leak bug in a single sign error.
+    test_tier: local
+    notes: >-
+      The generated listeners include `global_=True` registrations, which opt
+      out of admission entirely: the card's oracle already names them, and
+      without one a filter that admitted nobody would still satisfy the "and no
+      listener registered at a non-ancestor scope" half.
+    status: passing
+    test_id: tests/test_scope.py::test_an_event_reaches_the_carriers_scope_and_every_ancestor
+
+  - id: PROP-SCOPE-003
+    claim: >-
+      After a scope is disposed, no contribution registered through it is
+      visible from any context and no listener registered through it receives
+      any event.
+    shape: conservation
+    evidence: [SEM-001, SEM-006]
+    domain:
+      generates: A scope tree with generated registrations and a generated disposal order over scopes.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        After each disposal, the unfiltered registry view contains nothing
+        registered by the disposed subtree, and a dispatch reaches none of its
+        listeners.
+      independence: >-
+        Uses the explicit unfiltered view, so a bug that merely hides entries
+        from filtered queries while leaving them registered still fails.
+    failure_value: >-
+      Session teardown that removes the scope tag but not the registrations, so
+      a long-running process accumulates the tools and listeners of every
+      session it has ever served.
+    test_tier: pr
+    notes: >-
+      Entries are removed by identity rather than by value, so two equal items
+      registered separately are two entries. That distinction is not observable
+      through this surface — removing either of two identical entries leaves an
+      identical registry — so it is a defensive choice rather than a tested
+      one: an item type with a custom `__eq__` would otherwise decide which
+      registration a disposal removes.
+    status: passing
+    test_id: tests/test_scope.py::test_disposing_a_scope_takes_everything_registered_through_it
+
+  - id: PROP-SCOPE-004
+    claim: >-
+      Disposing a scope disposes every descendant scope first, and the disposal
+      completes only after all of them have.
+    shape: safety
+    evidence: [SEM-006]
+    domain:
+      generates: A scope tree with generated depths and generated per-scope teardown durations on a virtual clock.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        Each scope's teardown completion order is checked against the generated
+        tree: every descendant's completion precedes its ancestor's.
+      independence: "Ordering constraint derived from the generator's tree structure."
+    failure_value: >-
+      A parent session closing its transport while a sub-agent is still
+      flushing its final message, losing the last turn of every nested
+      conversation.
+    test_tier: pr
+    notes: >-
+      Teardown durations are logical: each scope registers an effect whose
+      disposer sleeps on the virtual clock, and the test drives the clock one
+      deadline at a time while the disposal is in flight. A wall-clock version
+      of this card would be asserting on the scheduler's mood.
+    status: passing
+    test_id: tests/test_scope.py::test_a_scope_finishes_only_after_every_scope_beneath_it
+
+  - id: PROP-SCOPE-005
+    claim: >-
+      Creating and disposing many scopes leaves no residual scope objects,
+      registry entries, or listeners.
+    shape: conservation
+    evidence: [SEM-001, SEM-006]
+    domain:
+      generates: A generated number of create/register/dispose cycles, some nested, some overlapping in time.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        After a forced garbage collection, live scope object count, registry
+        size and listener count return to their pre-cycle values.
+      independence: >-
+        Liveness measured through weak references, which reflect actual
+        reachability rather than any bookkeeping the scope system maintains.
+    failure_value: >-
+      A parent scope holding strong references to disposed children so it can
+      report on them, turning a long-lived server into a monotonic memory leak
+      proportional to sessions served.
+    test_tier: nightly
+    status: passing
+    test_id: tests/test_scope.py::test_a_finished_scope_leaves_nothing_behind
+
+  - id: PROP-SCOPE-006
+    claim: >-
+      The unfiltered view returns every live registration, whatever scope the
+      caller is in, and filtering a query never changes what is registered.
+    shape: differential
+    evidence: [SEM-005, SEM-007]
+    domain:
+      generates: >-
+        A scope tree with registrations at generated scopes, queried from every
+        scope both ways.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        `all()` equals the test's own record of everything registered and not
+        disposed, from every querying context; `visible(ctx=...)` is a subset of
+        it for every context.
+      independence: >-
+        The record is the test's list of registration calls, and the queries
+        are made from contexts the test built.
+    failure_value: >-
+      A "scoped" registry that drops entries rather than hiding them, so the
+      session recorder and the diagnostics tree — both of which read the
+      unfiltered view — quietly under-report, and SEM-005's caveat reads as a
+      guarantee it never was.
+    test_tier: local
+    status: passing
+    test_id: tests/test_scope.py::test_the_unfiltered_view_is_unfiltered
+
+open_questions:
+  - >-
+    RESOLVED (`all()` stays a plain method). Gating it would be theatre, as
+    SEM-005 already says: nothing about a scope withholds anything from a
+    caller who holds the registry. The visual distinction review needs is
+    carried by the signature instead — `visible(*, ctx=...)` cannot be called
+    without naming the context it filters for, and `all()` cannot be mistaken
+    for it. PROP-SCOPE-006 pins the behaviour so the caveat is testable rather
+    than only documented.

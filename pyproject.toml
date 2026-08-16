@@ -1,0 +1,176 @@
+[project]
+name = "cordis-python"
+dynamic = ["version"]
+description = "A Pythonic port of the Cordis composition kernel: contexts, effects, fibers, services, and a declarative plugin loader."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Dariusz Debowczyk" }]
+keywords = ["plugin", "dependency-injection", "composition", "cordis", "asyncio"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+    "Typing :: Typed",
+]
+
+# The kernel has no runtime dependencies. Serialisation formats and config
+# validators arrive through optional adapters, so a consumer that has already
+# standardised on one is never forced to install another.
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6.0"]
+pydantic = ["pydantic>=2.0"]
+
+[project.urls]
+Homepage = "https://github.com/ddebowczyk/cordis-python"
+Source = "https://github.com/ddebowczyk/cordis-python"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# One source of truth for the version: `cordis.__version__`.
+[tool.hatch.version]
+path = "src/cordis/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cordis"]
+
+[tool.hatch.build.targets.sdist]
+# The capability catalog ships with the source: it is the contract the tests
+# are generated from, so a downstream fork gets the spec, not just the code.
+include = ["src", "tests", "spec", "examples", "docs", "README.md"]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.100",
+    "mypy>=1.11",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pyyaml>=6.0",
+    "ruff>=0.6",
+    "types-pyyaml>=6.0",
+]
+
+# --------------------------------------------------------------------------
+# ruff
+# --------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "A",      # builtin shadowing
+    "ANN",    # missing annotations
+    "ARG",    # unused arguments
+    "ASYNC",  # asyncio antipatterns
+    "B",      # bugbear
+    "C4",     # comprehensions
+    "E", "W", # pycodestyle
+    "F",      # pyflakes
+    "FBT",    # boolean trap
+    "I",      # import sorting
+    "N",      # naming
+    "PERF",   # performance antipatterns
+    "PIE",
+    "PT",     # pytest style
+    "PTH",    # use pathlib
+    "RET",
+    "RSE",
+    "RUF",
+    "SIM",
+    "SLF",    # private member access
+    "TC",     # type-checking-only imports
+    "TID",    # tidy imports
+    "UP",     # pyupgrade
+]
+ignore = [
+    # The framework's own error messages are long and deliberately specific;
+    # forcing them into named constants would hurt readability at the raise site.
+    "TRY003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# A Context walks its own ancestors and initialises its own children, so it
+# reads slots on other Context instances. SLF001 cannot tell same-class access
+# from reaching into a stranger; this module is the one place that distinction
+# is load-bearing, and every such access is to `_parent`, `_meta`, `_root`,
+# `_label` or `_resolver` of another Context.
+"src/cordis/context.py" = ["SLF001"]
+# A fiber detaches itself from its parent's child list and reads the parent's
+# nursery when it opens its own environment: same-class access to a sibling
+# node of the same tree, which SLF001 cannot tell from reaching into a
+# stranger's internals.
+"src/cordis/fiber.py" = ["SLF001"]
+# One capability, two cooperating classes: a handle initialises its children
+# and a host initialises its root handle. That is the same private structure
+# under two names, which SLF001 cannot tell apart from reaching into a
+# stranger's internals.
+"src/cordis/plugin.py" = ["SLF001"]
+# Tests legitimately touch internals to observe state the public API hides,
+# property tests use assert as their whole point, and a plugin body that
+# ignores the context it is handed is a shape the specification supports.
+"tests/**" = [
+    "ANN401",
+    "ARG001",
+    "ARG002",
+    "ARG004",
+    "ARG005",
+    "FBT001",
+    "FBT003",
+    "SLF001",
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+[tool.ruff.lint.isort]
+known-first-party = ["cordis"]
+
+# --------------------------------------------------------------------------
+# mypy
+# --------------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "tests", "examples"]
+# Strict means strict: no per-module relaxations. If a signature cannot be
+# expressed, that is a design signal, not a reason to loosen the gate. The
+# examples are held to it too: an example that only type-checks loosely is
+# advice a reader cannot follow.
+warn_unreachable = true
+warn_unused_ignores = true
+enable_error_code = [
+    "ignore-without-code",
+    "redundant-expr",
+    "truthy-bool",
+]
+
+# --------------------------------------------------------------------------
+# pytest
+# --------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers --strict-config"
+markers = [
+    # Mirrors the `test_tier` field of every property card in spec/capabilities.
+    "tier_local: fast feedback, runs on every save",
+    "tier_pr: runs on every pull request",
+    "tier_nightly: longer campaigns, runs nightly",
+    "tier_release: exhaustive, runs before a release or during an incident",
+]
+filterwarnings = ["error"]

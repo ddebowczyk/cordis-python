@@ -1,0 +1,13 @@
+# A patch layer: the deployment-specific half of the config, kept apart from
+# the application it patches. Folded onto cordis.yml, it replaces the store
+# with the file-backed provider -- and nothing else in the file changes.
+#
+# `name` here is what the entry must currently be. Getting it wrong is an
+# error naming this layer, not a patch quietly applied to the wrong row.
+
+patches:
+  - id: store
+    name: examples.notes.providers:MemoryStore
+    fields:
+      name: examples.notes.providers:FileStore
+      config: { path: notes.json }

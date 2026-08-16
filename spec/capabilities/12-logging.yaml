@@ -1,0 +1,412 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: logging
+title: Logging — a structured record channel with pluggable exporters
+status: implemented
+tier: 2
+summary: >-
+  A logger service producing structured records tagged with their originating
+  fiber, delivered to zero or more exporters that are themselves plugins — so
+  where logs go is a configuration decision, not a code decision.
+
+problem:
+  statement: >-
+    A composable runtime needs a record channel that knows which plugin
+    produced each record, that works before any output destination is
+    configured, and whose destinations can be added and removed while running.
+    Python's stdlib logging is global, configured imperatively, and knows
+    nothing about plugin identity.
+  without_this:
+    - Records cannot be attributed to a fiber, so in a tree of forty plugins a
+      warning names a module rather than the configuration entry.
+    - Output configuration is imperative and global, so two embedders in one
+      process fight over it.
+    - Startup errors occurring before output is configured are lost, which is
+      exactly when they matter most.
+  rejected_alternatives:
+    - option: Use stdlib logging directly and stop there.
+      why_rejected: >-
+        Global state, no fiber attribution, and handler configuration that
+        cannot be scoped or unloaded. The framework instead bridges *to* stdlib
+        through an exporter, which is the direction that composes.
+    - option: Return a plain logging.Logger from ctx.logger.
+      why_rejected: >-
+        Loses the fiber tag and reintroduces global handler configuration; the
+        bridge exporter gives interoperability without the coupling.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/core/src/logger.ts
+      symbol: "Logger, Message, Exporter"
+      note: >-
+        Upstream's logger is a callable service; without a console exporter
+        mounted, boot-time errors are invisible — a documented sharp edge this
+        port removes with SEM-005.
+    - repo: kb-docs
+      path: modular-software/cordis-cheatsheet.md
+      symbol: "§2.9 Logger"
+
+depends_on: [service-registry, effect-scope]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      Obtaining a logger for a context returns one bound to that context's
+      fiber; every record it produces carries a monotonically increasing
+      sequence number, a timestamp, the logger name, the level, the payload,
+      and the originating fiber's identity.
+    rationale: >-
+      Attribution must be automatic; a logger that requires the caller to
+      include its own identity will be used inconsistently.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      Exporters register as effects and receive every record produced after
+      their registration, in sequence-number order.
+    rationale: >-
+      Out-of-order delivery makes interleaved logs unreadable and makes
+      sequence numbers pointless.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      An exporter that raises does not prevent other exporters from receiving
+      the record, and does not propagate to the logging call site.
+    rationale: >-
+      A logging call must never be able to fail the operation being logged.
+
+  - id: SEM-004
+    kind: MUST-NOT
+    rule: >-
+      Record construction MUST NOT occur for a level no exporter is interested
+      in, and payload formatting MUST NOT occur unless a record is constructed.
+    rationale: >-
+      Debug logging in a hot path costs nothing only if the argument
+      formatting is genuinely deferred.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      Records produced while no exporter is registered are buffered up to a
+      bounded count and delivered to the first exporter that registers;
+      overflow drops the oldest and records the drop count.
+    rationale: >-
+      Boot-time failures happen before the console exporter is mounted. Losing
+      them is the difference between a five-second and a one-hour diagnosis.
+    deviation:
+      upstream: "Upstream discards records produced before an exporter exists."
+      rationale: >-
+        The upstream behaviour is a documented footgun; a bounded replay buffer
+        removes it at negligible cost.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      Disposing an exporter's registering scope stops delivery to it
+      immediately; no record produced after disposal reaches it.
+    rationale: Same discipline as every other registration.
+
+python_design:
+  module: cordis.logging
+  surface:
+    - "# cordis.logging:"
+    - "class Level(enum.IntEnum): DEBUG = 10; INFO = 20; WARNING = 30; ERROR = 40"
+    - "@dataclass(frozen=True, slots=True)\nclass Record: seq, ts, name, level, message, args, fiber, extra"
+    - "    def render(self) -> str: ...   # `message % args`, done by whoever wants text"
+    - "class Exporter(Protocol):\n    def export(self, record: Record, /) -> None: ..."
+    - "@dataclass(frozen=True)\nclass ExportFailure: exporter, record, error"
+    - "class LoggerService(Service):"
+    - "    name = 'logger'"
+    - "    def __call__(self, name: str, /, *, fiber: str = DETACHED) -> Logger: ..."
+    - "    def add_exporter(self, exporter, /, *, scope: EffectScope, level: Level | None = None) -> EffectHandle: ..."
+    - "    def on_error(self, handler: Callable[[ExportFailure], None]) -> Callable[[], None]: ..."
+    - "    @property\n    def threshold(self) -> int: ...   # the level below which nothing is built"
+    - "    @property\n    def dropped(self) -> int: ...     # replay-buffer overflow, so far"
+    - "class Logger:"
+    - "    def debug/info/warning/error(self, message: str, /, *args: object, **extra: object) -> None: ..."
+    - "    def log(self, level: Level, message: str, /, *args: object, **extra: object) -> None: ..."
+    - "def logger(ctx: Context, name: str, /) -> Logger: ...   # attributed to ctx's fiber"
+    - "# cordis.plugin, new in this capability:"
+    - "FIBER_KEY: Final = \"__fiber__\""
+    - "def fiber_of(ctx: Context) -> Fiber | None: ..."
+    - "# cordis.exporters:"
+    - "class ConsoleExporter:   # a stream, a format, nothing else"
+    - "class StdlibExporter:    # bridges to logging.Logger, one per record name"
+    - "DEFAULT_BUFFER: Final = 1024   # records held before an exporter is bound"
+  idioms:
+    - >-
+      Lazy `%`-style formatting matching stdlib convention: the message and its
+      arguments are stored unformatted on the Record and rendered by whoever
+      wants text, which satisfies SEM-004 without a callable-per-call-site
+      idiom.
+    - >-
+      `logger(ctx, 'tools')` is a module-level reader taking a context, like
+      `scope_of`, `config_of`, `interceptions` and `filter_of` before it.
+      Upstream spells it `ctx.logger('tools')`, and `ctx.logger` does resolve
+      the service here -- but `Context.__getattr__` resolves a *name to one
+      shared object*, so the service reached that way cannot know which fiber
+      is asking. Attribution is the whole point of the capability, so the
+      spelling that carries a context wins over the spelling that matches
+      upstream.
+    - >-
+      Attribution is captured when the logger is made, not when a record is
+      written: a `Logger` holds the fiber label it was born with. A logger
+      handed to a callback therefore keeps naming the plugin that created it,
+      which is the attribution a reader of the log wants.
+    - >-
+      The timestamp comes from a `clock` service when one is bound and from
+      `time.time` otherwise, resolved once per logger service. That is the
+      scheduling capability's `Clock` protocol (`now()`), consulted
+      structurally rather than imported, so logging does not depend on
+      capability 13 and a test can make time deterministic by providing a
+      clock.
+    - >-
+      An exporter failure goes to the same shape of error channel the event bus
+      already has: `on_error(handler)`, and an unhandled failure prints a
+      traceback to stderr rather than vanishing.
+  typing_notes:
+    - >-
+      `Exporter` is a structural Protocol, so any object with `export` works
+      and no registration or subclassing is required. Level interest is a
+      registration keyword rather than a protocol member for the same reason:
+      requiring an attribute would exclude a bare function-like object, and
+      `add_exporter(x, level=...)` states the interest where the decision is
+      actually made. An exporter carrying its own `level` attribute is honoured
+      when the keyword is omitted.
+    - >-
+      `Level` is an `IntEnum` with stdlib's numeric values, so the bridge
+      exporter passes levels through untranslated and a threshold comparison is
+      an integer comparison.
+    - >-
+      `Record.extra` defaults to a shared empty `MappingProxyType` supplied by
+      `field(default_factory=...)`. Python 3.11's `dataclasses` rejects a
+      `mappingproxy` written as a plain default — it reads as mutable — while
+      3.12 accepts it, so on the minimum supported interpreter the plain
+      spelling turns `import cordis` into a `ValueError`. See the same note on
+      `16-config-layering`.
+  concurrency:
+    - >-
+      Sequence numbers are assigned from a plain counter; exporters are invoked
+      synchronously in registration order so SEM-002's ordering holds without a
+      queue.
+  deviations:
+    - >-
+      The shipped exporters live in `cordis.exporters`, not in a
+      `cordis.logging.exporters` package. The reason `cordis.logging` is flat is
+      the reason `cordis.filter` is: a package holding two small modules moves
+      code without telling a reader anything. Nothing in the core imports
+      `cordis.exporters`, which is what "the core does not import stdlib
+      logging" actually asks for -- importing a bridge module is harmless, and
+      the sharp edge the rejected alternative names is global handler
+      configuration, which no exporter performs.
+    - >-
+      "The core does not import stdlib logging" cannot be checked by asking
+      whether `logging` is in `sys.modules`: `asyncio` imports it, and a
+      composition kernel for async applications imports `asyncio`. The
+      observable claim -- and the one the test makes -- is that `import cordis`
+      leaves `cordis.exporters` unimported, the root logger without handlers
+      and no `cordis` logger in the manager, so nothing about an application's
+      logging configuration changes until it asks for output.
+    - >-
+      The replay buffer fills only until the first exporter ever registers, not
+      whenever no exporter happens to be registered. SEM-005 exists for the
+      window before output is configured; re-buffering after the last exporter
+      is disposed would resurrect records into an exporter mounted minutes
+      later, out of every context that made them legible -- and it would make
+      "the application is shutting down" a memory-growth event.
+    - >-
+      The overflow drop count is reported as a synthetic WARNING record
+      delivered *after* the replay rather than before it. A notice constructed
+      at replay time carries a sequence number higher than every record it
+      describes, and delivering it first would hand an exporter a descending
+      pair -- breaking SEM-002's ordering guarantee on its very first two
+      records. After the replay the same notice is in order, and it still
+      arrives before anything live.
+    - >-
+      A fourth scoped key, `FIBER_KEY`, is added to the mount frame in
+      capability 03 alongside scope, config and the mount callable, with a
+      `fiber_of(ctx)` reader. The mount callable already keeps the handle alive
+      from its own context, so this adds a dict entry and no reference; the
+      alternative -- recovering the handle from the bound method's `__self__`
+      -- would make attribution depend on an implementation detail of how the
+      mount frame is spelled.
+
+properties:
+
+  - id: PROP-LOG-001
+    claim: >-
+      Every record produced after an exporter registers is delivered to it
+      exactly once, in strictly increasing sequence order.
+    shape: conservation
+    evidence: [SEM-001, SEM-002]
+    domain:
+      generates: >-
+        A generated interleaving of log calls across several loggers and
+        fibers, with exporters registering and disposing at generated points.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        For each exporter, the expected record set is the set of log calls the
+        test issued between its registration and disposal; ordering is checked
+        by asserting the received sequence numbers are strictly increasing.
+      independence: >-
+        The expected set comes from the test's own call log with its own
+        timestamps of registration events.
+    failure_value: >-
+      Delivering through an async queue without ordering guarantees, so
+      interleaved records from two fibers appear shuffled and a causal
+      sequence in the log no longer reflects the real one.
+    test_tier: local
+    status: passing
+    test_id: tests/test_logging.py::test_every_record_reaches_every_live_exporter_once_in_order
+
+  - id: PROP-LOG-002
+    claim: >-
+      A raising exporter receives no special treatment: every other exporter
+      still receives every record, and no logging call raises.
+    shape: safety
+    evidence: [SEM-003]
+    domain:
+      generates: Several exporters with a generated subset raising on a generated subset of records.
+    preconditions:
+      - At least one exporter raises; guaranteed by construction.
+    oracle:
+      kind: invariant
+      description: >-
+        Non-raising exporters' received sets equal the full expected set, and
+        no log call raised.
+      independence: "The raising plan is the generator's; receipt is observed per exporter."
+    failure_value: >-
+      A file exporter failing on a full disk taking down the console exporter
+      too, so the operator loses visibility exactly when the system is
+      degrading.
+    test_tier: local
+    status: passing
+    test_id: tests/test_logging.py::test_a_raising_exporter_costs_nobody_else_anything
+
+  - id: PROP-LOG-003
+    claim: >-
+      Records produced before any exporter registers are replayed to the first
+      exporter, in order, up to the buffer bound, with the drop count reported
+      when the bound is exceeded.
+    shape: conservation
+    evidence: [SEM-005]
+    domain:
+      generates: A generated number of pre-registration records spanning below, at, and above the configured bound.
+      strategy_hint: >-
+        Draw the record count from an explicit distribution around the bound
+        (bound-1, bound, bound+1, bound*3) rather than uniformly, so the
+        boundary cases are hit reliably.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        Expected replay is the last `bound` records of the issued sequence, and
+        the expected drop count is `max(0, issued - bound)`.
+      independence: "Computed from the test's own issued list by slicing."
+    failure_value: >-
+      An unbounded buffer, so a process that never mounts an exporter — the
+      normal case for a library embedding the framework — grows until it is
+      killed.
+    test_tier: local
+    status: passing
+    test_id: tests/test_logging.py::test_the_buffer_replays_its_tail_and_owns_up_to_the_rest
+
+  - id: PROP-LOG-004
+    claim: >-
+      No message formatting occurs for a record that no exporter will receive.
+    shape: safety
+    evidence: [SEM-004]
+    domain:
+      generates: Log calls at generated levels with arguments whose formatting increments a counter, under generated exporter level interests.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        The formatting counter equals the number of records actually delivered
+        and formatted by an exporter, not the number of log calls issued.
+      independence: >-
+        The counter is inside the test's argument objects (`__str__`/
+        `__format__` spies), entirely outside the logger.
+    failure_value: >-
+      Eager `f`-string style formatting inside the logger, making a debug call
+      in a per-token hot path cost a string build per token even when debug
+      output is off.
+    test_tier: local
+    status: passing
+    test_id: tests/test_logging.py::test_nothing_is_formatted_for_a_reader_that_does_not_exist
+
+  - id: PROP-LOG-005
+    claim: >-
+      Every record's fiber identity equals the fiber whose context obtained the
+      logger.
+    shape: safety
+    evidence: [SEM-001]
+    domain:
+      generates: A plugin tree where each plugin logs a generated number of records from its own context.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Each delivered record's fiber id is matched against the id the emitting
+        plugin recorded for itself at load time.
+      independence: >-
+        The plugin's own id is captured by the test's plugin body, not derived
+        from the record.
+    failure_value: >-
+      Attributing records to the fiber that *provides* the logger service
+      rather than to the one that asked for a logger. The logger is normally
+      mounted once near the root, so the defect makes every record in a
+      forty-plugin tree say `root` — attribution that is present, plausible and
+      useless.
+    notes: >-
+      Failure value restated during implementation. The card first named "binding the logger to the context at call time
+      rather than at construction". No such mutant exists here: a `Logger`
+      never sees a context after it is made, so there is no call-time binding
+      to get wrong. The defect that *is* reachable is reading the fiber off the
+      wrong context — the service's own instead of the caller's — and it is the
+      same mistake in the same place, so the card names that instead.
+    test_tier: local
+    status: passing
+    test_id: tests/test_logging.py::test_every_record_names_the_instance_that_wrote_it
+
+  - id: PROP-LOG-006
+    claim: >-
+      No record produced after an exporter's registering scope is disposed
+      reaches that exporter.
+    shape: safety
+    evidence: [SEM-006]
+    domain:
+      generates: Exporters registered on a generated tree of scopes, with a generated disposal order interleaved with log calls.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Every record an exporter received has a sequence number lower than the
+        sequence number in effect at its scope's disposal.
+      independence: >-
+        Sequence numbers at disposal are read by the test at the moment it
+        disposes, independently of the delivery path.
+    failure_value: >-
+      A file exporter continuing to receive records after its plugin unloads,
+      writing to a file handle that a subsequent reload has already reopened
+      and truncated.
+    test_tier: local
+    status: passing
+    test_id: tests/test_logging.py::test_no_record_outlives_the_scope_that_wanted_it
+
+open_questions:
+  - >-
+    STILL OPEN (implementation shipped one buffer): whether the replay buffer
+    should be per-level, so a flood of debug records cannot evict the boot-time
+    errors that motivated SEM-005. What is shipped is a single bounded deque, a
+    single drop count, and one WARNING notice naming it — so an application
+    that hits the bound is told, which is the part that could not be added
+    later without changing what an exporter sees. Splitting it per level
+    complicates the drop accounting and is still deferred until a bound has
+    been chosen from real usage.

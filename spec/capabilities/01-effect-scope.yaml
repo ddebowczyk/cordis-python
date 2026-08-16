@@ -1,0 +1,455 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: effect-scope
+title: Effect scope — every registration returns its own undo
+status: implemented
+tier: 0
+summary: >-
+  A disposal scope that accepts a resource-acquiring effect in any of the
+  supported shapes, records its disposer, and unwinds all disposers exactly
+  once, in reverse order, even when setup or teardown raises.
+
+problem:
+  statement: >-
+    In a system where any subtree can be unloaded at runtime, cleanup cannot be
+    a courtesy. Every side effect a plugin performs — a listener, a socket, a
+    registry entry, a background task — must be reversible by the thing that
+    owns its lifetime, without the plugin author remembering to write a
+    teardown path.
+  without_this:
+    - Unloading a plugin leaves listeners subscribed, so a reloaded plugin
+      double-handles every event and the leak grows with each reload.
+    - Partial failure during startup leaks whatever was acquired before the
+      exception, because there is no scope holding the earlier acquisitions.
+    - Teardown order is unspecified, so a component is disposed while a
+      component that depends on it is still running.
+  rejected_alternatives:
+    - option: Rely on __del__ / garbage collection.
+      why_rejected: >-
+        Non-deterministic, never runs for reference cycles at a useful time,
+        and cannot express ordering between two dead objects.
+    - option: Require every plugin to be an async context manager.
+      why_rejected: >-
+        Forces the entire plugin body into a single `async with` and makes
+        conditional or late registration awkward; the effect API composes
+        with, rather than replaces, context managers — see the shapes below.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/core/src/fiber.ts
+      symbol: "Fiber.effect, Effect, Disposable, EffectMeta"
+      note: >-
+        Upstream fuses the disposal scope into Fiber. This port extracts it as
+        a standalone primitive so it can be specified and tested without a
+        plugin system, and so Fiber composes it rather than reimplements it.
+    - repo: deepseek-harness
+      path: AGENTS.md
+      symbol: "registrations are effects"
+    - repo: kb-docs
+      path: modular-software/cordis-cheatsheet.md
+      symbol: "§2.6 Effects"
+
+depends_on: []
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      `scope.effect(fn, label=...)` accepts fn returning any of: None, a
+      zero-argument callable disposer, an awaitable of either, a
+      (sync or async) context manager, or a (sync or async) iterable of
+      disposers — of which a generator is the common case. An empty iterable
+      is a valid no-op. Any other return raises `InvalidEffectError` and the
+      scope is left unchanged; strings, bytes and mappings are "any other
+      return" despite being iterable, because iterating them never yields a
+      disposer.
+    rationale: >-
+      One entry point for every resource idiom in Python; rejecting unknown
+      shapes loudly prevents a silently un-disposed registration.
+    deviation:
+      upstream: >-
+        Upstream accepts `Iterable<Disposable> | AsyncIterable<Disposable>`.
+      rationale: >-
+        This rule originally said "generator", which is narrower than both
+        upstream and the harness's own ITERABLE shape; the mismatch was found
+        by PROP-EFFECT-001 rejecting a plain list of disposers. Widened to
+        match upstream, with the string/bytes/mapping carve-out that Python
+        needs and TypeScript does not.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      Disposing a scope runs its disposers in exact reverse of the order they
+      were recorded.
+    rationale: >-
+      Later registrations may depend on earlier ones; LIFO is the only order
+      that respects construction dependencies without a dependency graph.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      Each recorded disposer runs at most once for the life of the scope, and
+      disposing an already-disposed scope is a no-op that raises nothing.
+    rationale: >-
+      Disposal is reachable from several directions (explicit, parent unload,
+      dependency loss); idempotency is what makes those safe to race.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      If an effect function raises during setup, any disposers it had already
+      yielded are run (reverse order) before the exception propagates, and
+      nothing from that effect remains recorded in the scope.
+    rationale: >-
+      A half-acquired effect is the leak case; atomicity at the effect boundary
+      is what makes "validate then commit" registries possible.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      A disposer that raises MUST NOT prevent the remaining disposers from
+      running. All teardown exceptions are collected and re-raised as a single
+      `ExceptionGroup` after the scope is fully unwound.
+    rationale: >-
+      One bad teardown must not strand every resource registered before it.
+      ExceptionGroup preserves all of them instead of the JS habit of losing
+      all but the first.
+    deviation:
+      upstream: >-
+        Upstream aggregates teardown errors ad hoc and, for async disposers,
+        runs them concurrently.
+      rationale: >-
+        Python 3.11 ExceptionGroup is the native aggregate. Concurrency is
+        retained but scoped — see SEM-006.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      Async disposers recorded in the same scope are awaited concurrently
+      within a batch, but batches respect reverse-order boundaries: a disposer
+      recorded before a sync disposer is not started until that sync disposer
+      has run.
+    rationale: >-
+      Preserves upstream's teardown throughput while keeping SEM-002's
+      ordering guarantee observable rather than accidental.
+
+  - id: SEM-007
+    kind: MUST
+    rule: >-
+      Registering an effect on a disposed scope raises `InactiveScopeError`
+      and does not run the effect function.
+    rationale: >-
+      Running acquisition into a scope that will never unwind is an
+      unconditional leak; failing loudly surfaces the real bug, which is a
+      registration racing its owner's teardown.
+
+  - id: SEM-008
+    kind: SHOULD
+    rule: >-
+      When an effect yields a disposer that is already recorded in the same
+      scope (compared by identity), it is recorded once, not twice.
+    rationale: >-
+      Nested composite effects commonly re-yield an inner disposer; running it
+      twice is the classic double-close.
+
+  - id: SEM-009
+    kind: MUST
+    rule: >-
+      Every recorded effect carries its `label` and the source location of its
+      registration, and `scope.tree()` returns that metadata for the scope and
+      its child scopes.
+    rationale: >-
+      "What is still registered, and who registered it" is the first question
+      in every leak investigation; it must not require a debugger.
+
+python_design:
+  module: cordis.effect
+  surface:
+    - "Disposer: TypeAlias = Callable[[], None | Awaitable[None]]"
+    - "class EffectScope:"
+    - "    def effect(self, fn: EffectFn, /, label: str | None = None) -> Disposer: ..."
+    - "    def child(self, label: str | None = None) -> EffectScope: ..."
+    - "    async def dispose(self) -> None: ..."
+    - "    @property\n    def active(self) -> bool: ..."
+    - "    def tree(self) -> EffectNode: ..."
+    - "# cordis.errors -- the taxonomy root, named here because this is the first
+      capability that raises from it\nclass CordisError(Exception): ..."
+    - "class InvalidEffectError(CordisError): ..."
+    - "class InactiveScopeError(CordisError): ..."
+  idioms:
+    - >-
+      Generator effects are the composite form and map onto `@contextmanager`
+      /`@asynccontextmanager` conventions Python users already know; the
+      difference is that a Cordis generator may yield more than once, each
+      yield contributing one disposer.
+    - >-
+      Shape detection uses `inspect.isasyncgen`/`isgenerator`, the
+      `AbstractContextManager` ABCs, and `inspect.isawaitable` — structural
+      checks, not isinstance against concrete classes, so third-party resource
+      objects work unmodified.
+    - >-
+      `ExceptionGroup` for teardown aggregation; `asyncio.TaskGroup` for the
+      concurrent batches in SEM-006.
+    - >-
+      The registration site is captured with a single `sys._getframe(1)` read
+      guarded by a module flag, so diagnostics cost nothing when disabled.
+  typing_notes:
+    - >-
+      `EffectFn` is a union of the accepted callables; overloads on `effect()`
+      preserve the disposer return type for each shape so mypy --strict keeps
+      working at call sites.
+  concurrency:
+    - >-
+      `dispose()` is idempotent under concurrent callers: the first caller
+      performs the unwind, later callers await the same completion rather than
+      returning early while teardown is still in flight.
+    - >-
+      Cancellation during dispose must still complete the unwind; the teardown
+      body runs shielded and re-raises CancelledError afterwards.
+
+properties:
+
+  - id: PROP-EFFECT-001
+    claim: >-
+      After disposing a scope, the number of live resources acquired through it
+      is zero, for any sequence of effects in any supported shape.
+    shape: conservation
+    evidence: [SEM-001, SEM-002, SEM-003]
+    domain:
+      generates: >-
+        A list of 0-30 effect specs, each drawn uniformly from the supported
+        shapes (plain disposer, awaitable, sync/async context manager,
+        sync/async generator yielding 1-3 disposers, None).
+      excludes:
+        - Effects that raise; covered by PROP-EFFECT-004 and PROP-EFFECT-005.
+      strategy_hint: >-
+        Each spec constructs a resource that increments a shared counter on
+        acquire and decrements on release; build the specs directly from a
+        sampled_from over shape constructors rather than filtering.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        A ledger object counts acquire and release calls per resource id.
+        After dispose, every id has release_count == acquire_count == 1.
+      independence: >-
+        The ledger is written by the generated resources, not by the scope; it
+        observes what actually happened to the resources rather than what the
+        scope believes it recorded, so a scope that drops a disposer from its
+        list still fails.
+    failure_value: >-
+      A shape-dispatch branch that treats an async generator's first yield as
+      the whole effect, silently discarding every later-yielded disposer, so a
+      composite registration half-leaks on every unload.
+    test_tier: local
+    status: passing
+    test_id: tests/test_effect_scope.py::test_disposing_a_scope_releases_every_resource
+
+  - id: PROP-EFFECT-002
+    claim: >-
+      Disposers run in the exact reverse of the order in which they were
+      recorded.
+    shape: differential
+    evidence: [SEM-002, SEM-006]
+    domain:
+      generates: >-
+        A list of 1-30 effects each yielding one identifiable disposer,
+        interleaving sync and async disposers so the concurrency batching in
+        SEM-006 is exercised.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The test records the registration order into a plain list and asserts
+        the observed disposal order equals `list(reversed(registered))`.
+      independence: >-
+        The expected order comes from the test's own append log built at
+        registration time, never from the scope's internal disposer list, so an
+        implementation that stores disposers in the wrong order cannot make
+        both sides agree.
+    failure_value: >-
+      Switching the internal store to a dict for dedup (SEM-008) and iterating
+      it forward, quietly turning LIFO into FIFO so a connection pool is closed
+      before the tasks using it.
+    test_tier: local
+    status: passing
+    test_id: tests/test_effect_scope.py::test_disposers_run_in_exact_reverse_of_registration
+
+  - id: PROP-EFFECT-003
+    claim: >-
+      Calling dispose n times has the same observable outcome as calling it
+      once, for any n >= 1 and any interleaving of concurrent callers.
+    shape: idempotency
+    evidence: [SEM-003]
+    domain:
+      generates: >-
+        An effect list, a repeat count 1-5, and a flag choosing sequential vs
+        concurrent (asyncio.gather) invocation of dispose.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Release counts per resource are exactly 1 after all dispose calls
+        return, and no dispose call raised.
+      independence: >-
+        Counts come from the resource ledger; the property compares against the
+        constant 1, not against another run of the implementation.
+    failure_value: >-
+      A `disposed` flag set at the end of the unwind rather than the start, so
+      two concurrent disposals both pass the guard and every disposer runs
+      twice — the double-close that only appears under load.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_effect_scope.py::test_dispose_is_idempotent_however_it_is_called
+
+  - id: PROP-EFFECT-004
+    claim: >-
+      When an effect raises partway through setup, every disposer it had
+      already yielded is released and the scope retains no record of that
+      effect.
+    shape: safety
+    evidence: [SEM-004]
+    domain:
+      generates: >-
+        A generator effect that yields k disposers (0 <= k <= 5) and then
+        raises a marker exception, embedded at a random index within a list of
+        well-behaved effects.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Immediately after the raising call returns control, the k resources are
+        released, the earlier well-behaved effects are still live, and
+        `scope.tree()` contains no node for the failed effect.
+      independence: >-
+        Asserts on the resource ledger and on the public diagnostics tree,
+        which are produced by different code paths than the rollback logic.
+    failure_value: >-
+      Rollback that unwinds the whole scope instead of only the failing effect,
+      tearing down a plugin's earlier, valid registrations because one late
+      registration had a bad argument.
+    test_tier: local
+    status: passing
+    test_id: tests/test_effect_scope.py::test_a_failed_setup_releases_only_its_own_resources
+
+  - id: PROP-EFFECT-005
+    claim: >-
+      If any disposers raise during unwind, all other disposers still run
+      exactly once and every raised exception appears in the resulting
+      ExceptionGroup.
+    shape: safety
+    evidence: [SEM-005]
+    domain:
+      generates: >-
+        An effect list where a generated subset of disposers raise marker
+        exceptions carrying their own index.
+      excludes:
+        - BaseException subclasses outside Exception (cancellation is
+          specified separately under concurrency notes).
+    preconditions:
+      - At least one disposer raises; enforced by construction, not by filtering.
+    oracle:
+      kind: invariant
+      description: >-
+        Non-raising resources all show release_count == 1, and the set of
+        marker indices in the flattened ExceptionGroup equals the set of
+        indices chosen to raise.
+      independence: >-
+        The expected exception set is the generator's own choice, decided
+        before the scope ran; the implementation cannot influence it.
+    failure_value: >-
+      A `try/except` around the unwind loop rather than around each disposer,
+      so the first failing teardown strands every resource registered before it
+      and hides the remaining errors.
+    test_tier: local
+    status: passing
+    test_id: tests/test_effect_scope.py::test_a_raising_disposer_does_not_strand_the_others
+
+  - id: PROP-EFFECT-006
+    claim: >-
+      Registering an effect on a disposed scope raises InactiveScopeError
+      without invoking the effect function.
+    shape: safety
+    evidence: [SEM-007]
+    domain:
+      generates: An effect list, a dispose point, and further registration attempts after that point.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        A spy effect function records invocation; assert it was never called
+        and that InactiveScopeError was raised.
+      independence: >-
+        Observes invocation rather than return value, so an implementation that
+        runs the effect and then discards its disposer still fails.
+    failure_value: >-
+      A late registration from a background task that survived teardown,
+      silently acquiring a socket into a dead scope — a leak with no owner and
+      no diagnostic.
+    test_tier: local
+    status: passing
+    test_id: tests/test_effect_scope.py::test_registering_on_a_disposed_scope_never_runs_the_effect
+
+  - id: PROP-EFFECT-007
+    claim: >-
+      An effect returning a value of an unsupported shape raises
+      InvalidEffectError and leaves the scope's recorded effects unchanged.
+    shape: safety
+    evidence: [SEM-001]
+    domain:
+      generates: >-
+        Values that are not valid effect results: ints, strings, lists,
+        non-callable objects, objects with a `close` attribute that is not
+        callable, and coroutines resolving to such values.
+      excludes:
+        - None, callables, awaitables, context managers, generators.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        `scope.tree()` node count is identical before and after the failed
+        registration, and the raised error names the offending type.
+      independence: >-
+        Uses the public diagnostics tree as the state observation rather than
+        the private disposer list.
+    failure_value: >-
+      Accepting a truthy non-callable as a disposer and calling it at teardown,
+      turning an author's typo into a TypeError during unload — at the exact
+      moment the process is trying to shut down cleanly.
+    test_tier: local
+    status: passing
+    test_id: tests/test_effect_scope.py::test_an_unsupported_shape_is_rejected_and_changes_nothing
+
+  - id: PROP-EFFECT-008
+    claim: >-
+      Disposing a parent scope disposes all descendant scopes, and each
+      descendant's resources are released before the parent effects registered
+      earlier than that descendant.
+    shape: safety
+    evidence: [SEM-002, SEM-009]
+    domain:
+      generates: A nested scope tree (depth 1-4) with effects registered at each level in generated order.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        A flattened expected order computed by the test from the recorded
+        (scope, index) registration log using reverse-LIFO over the tree.
+      independence: >-
+        The expected order is derived from the construction log by a few lines
+        of test-local list arithmetic, independent of the scope's traversal.
+    failure_value: >-
+      Child scopes disposed after the parent's own disposers, so a child's
+      background task outlives the connection its parent closed.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_effect_scope.py::test_a_child_scope_unwinds_at_its_place_in_the_parents_order
+
+open_questions:
+  - >-
+    Whether SEM-008's identity-based dedup should extend to bound methods,
+    which compare equal but are not identical. Upstream dedups by function
+    identity, which for bound methods dedups nothing; matching that is the
+    conservative default but it is a real footgun worth a lint rule.

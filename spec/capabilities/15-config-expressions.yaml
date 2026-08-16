@@ -1,0 +1,490 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: config-expressions
+title: Config expressions — computed values without arbitrary code execution
+status: implemented
+tier: 3
+summary: >-
+  A restricted, side-effect-free expression language usable in specific entry
+  fields, so a config file can reference the environment, other entries, and
+  live service values without becoming a program.
+
+problem:
+  statement: >-
+    Static configuration cannot express "the port from the environment", "the
+    same base path as that other entry", or "enabled only when a capability is
+    present". The obvious fix — evaluating arbitrary code from the config file
+    — turns every config file into executable code with the process's full
+    authority, which is unacceptable for files that are generated, patched by
+    layers, or shipped by third parties.
+  without_this:
+    - Every deployment-varying value must be templated by an external tool
+      before the file is read, so the file on disk is not the file that runs.
+    - Cross-entry consistency (two plugins needing the same directory) is
+      maintained by copy-paste.
+    - Conditional inclusion requires generating different files per
+      environment.
+  rejected_alternatives:
+    - option: Python eval on a tagged string.
+      why_rejected: >-
+        Full code execution with the process's authority, reachable from any
+        layer that can contribute a patch. Upstream's `!!js` tag has exactly
+        this property and confines it to two fields; confinement is a mitigation,
+        not a fix.
+    - option: Environment variable interpolation only.
+      why_rejected: >-
+        Covers the commonest case but not cross-entry references or
+        capability-conditional entries, both of which appear immediately in
+        layered configurations.
+    - option: A full template language (Jinja).
+      why_rejected: >-
+        Large surface, still permits surprising evaluation semantics, and
+        conflates text templating with value computation.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/loader/src/config/utils.ts
+      symbol: "evaluate, interpolate"
+    - repo: cordis
+      path: packages/include/src/index.ts
+      symbol: "JsExpr yaml type"
+      note: >-
+        Upstream restricts the `!!js` tag to the `config` and `disabled` fields
+        and evaluates `config` against the plugin context after injections
+        activate, `disabled` against the loader context at every mount decision.
+    - repo: kb-docs
+      path: modular-software/cordis-cheatsheet.md
+      symbol: "§4.2 !!js"
+
+depends_on: [declarative-loader]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      Expressions are permitted only in the `config` and `disabled` fields of
+      an entry. An expression tag anywhere else is a validation error naming
+      the field.
+    rationale: >-
+      A closed set of evaluation sites is what makes the security surface
+      auditable; `name` in particular must never be computed, or the set of
+      loadable code becomes dynamic.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      The expression language supports literals, attribute and index access,
+      comparison and boolean operators, arithmetic on numbers, and calls to a
+      registered allow-list of pure functions. It supports nothing else — no
+      imports, no attribute access to dunders, no lambdas, no comprehensions
+      with side effects, no assignment.
+    rationale: >-
+      Enumerating what is allowed, rather than blocking what is not, is the
+      only form of this that survives review.
+    deviation:
+      upstream: "Upstream evaluates arbitrary JavaScript."
+      rationale: >-
+        A config file is data that arrives from bundles, profiles, home
+        directories and CLI overlays. Treating it as code means any of those
+        layers can execute arbitrary code. The restricted evaluator keeps the
+        useful cases and removes the capability.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      Evaluation is side-effect free and deterministic given its inputs;
+      the allow-list may only contain functions with that property.
+    rationale: >-
+      `disabled` is re-evaluated at every mount decision. A non-deterministic
+      expression there produces a system that mounts and unmounts a plugin
+      forever.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      A `config` expression is evaluated against the entry's own context after
+      its declared injections are available; a `disabled` expression is
+      evaluated against the loader's context at every mount decision.
+    rationale: >-
+      The two fields answer different questions at different times. Evaluating
+      `disabled` in the plugin's context would require mounting the plugin to
+      decide whether to mount it.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      An expression that raises, references an unknown name, or exceeds the
+      evaluation step budget fails its entry with a message naming the entry,
+      the field, and the expression; it MUST NOT fail other entries.
+    rationale: >-
+      Same blast-radius rule as everywhere else; and a step budget is required
+      because even a restricted language can be made to loop.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      Expressions are represented in the source document by an explicit tag
+      that survives a read-modify-write round trip unevaluated.
+    rationale: >-
+      A tool that rewrites the config file must not silently freeze a computed
+      value into a literal.
+
+python_design:
+  module: cordis.expr
+  surface:
+    - "ENVELOPE: Final = '$expr'   # the portable tag key, in every format"
+    - "BUDGET: Final = 10_000      # default evaluation step budget"
+    - "FUNCTIONS: Final[Mapping[str, Callable[..., object]]]  # the default allow-list"
+    - "@dataclass(frozen=True, slots=True)\nclass Expr:\n    source: str"
+    - "@dataclass(frozen=True, slots=True)\nclass CompiledExpr:\n    source: str\n    tree: ast.Expression   # already validated against the grammar"
+    - "TAG: Final = '!expr'         # accepted in YAML in addition to the envelope"
+    - "MAX_DEPTH: Final = 64        # syntactic nesting, checked at compile time"
+    - "@dataclass(frozen=True, slots=True)\nclass Opaque:\n    why: str   # present in an environment, unreadable, and says why"
+    - "def compile_expr(source: str, /, *, entry_id: str, field: str) -> CompiledExpr   # cached by source alone"
+    - "def evaluate(expr: Expr | CompiledExpr, env: Mapping[str, object], /, *, functions: Mapping[str, Callable[..., object]] = FUNCTIONS, budget: int = BUDGET, entry_id: str, field: str) -> object"
+    - "def is_envelope(value: object, /) -> bool   # {'$expr': '...'} exactly"
+    - "def envelope_of(expr: Expr, /) -> dict[str, str]"
+    - "Problem: TypeAlias = tuple[tuple[str | int, ...], str, str]   # where, source, why"
+    - "def parse_expressions(value: object, /) -> tuple[object, tuple[Problem, ...]]"
+    - "def unparse_expressions(value: object, /) -> object   # Expr -> envelope, the one writer"
+    - "def expression_paths(value: object, /) -> tuple[tuple[str | int, ...], ...]"
+    - "def opaque(value: object, why: str, /) -> object   # every Expr in it replaced by Opaque(why)"
+    - "def substitute(value: object, env: Mapping[str, object], /, *, functions=FUNCTIONS, budget=BUDGET, entry_id: str, field: str) -> object"
+    - "def yaml_loader() -> type   # a SafeLoader subclass with `!expr` registered"
+    - "class FunctionSource(Protocol):\n    name: ClassVar[str] = 'expr.functions'\n    def functions(self) -> Mapping[str, Callable[..., object]]: ..."
+    - "class ExpressionError(CordisError, ValueError): entry_id, field, source, reason"
+    - "# cordis.loader, amended\nclass Entry:\n    disabled: bool | Expr = False"
+    - "# cordis.plugin, amended\nConfigPreparer: TypeAlias = Callable[[Context, object], object]\ndef plugin(self, target, config=None, /, *, requires=None, isolate=(), intercept=None, prepare: ConfigPreparer | None = None) -> PluginHandle"
+  idioms:
+    - >-
+      Parsing uses `ast.parse(source, mode='eval')` followed by a whitelist
+      walk that rejects any node type not in the allowed set; evaluation then
+      walks the validated tree directly rather than calling `eval`, so there is
+      no path from a config file to `compile`/`exec` at all.
+    - >-
+      The environment is an explicit mapping built by the loader (env vars, the
+      entry's context, sibling entry ids), not the Python globals — so nothing
+      is reachable that was not deliberately exposed.
+    - >-
+      In YAML the tag is `!expr`; in JSON and TOML it is a single-key mapping
+      `{"$expr": "..."}`. Both round-trip through the `Expr` dataclass, which
+      satisfies SEM-006 by construction.
+    - >-
+      A `Call` is permitted only when its callee is a bare `Name` that resolves
+      in the `functions` mapping. `db.execute(...)` is therefore a compile-time
+      rejection while `db.url` is an ordinary read, which is the whole of the
+      "expose live services without exposing their behaviour" rule and needs no
+      per-object policy.
+    - >-
+      The allow-list is a parameter of `evaluate`, not a process-global
+      registry: the caller that builds the environment is the caller that
+      decides what may be called on it. That removes the only piece of mutable
+      global state the capability would otherwise have, and with it the test
+      isolation problem a registry brings.
+    - >-
+      `disabled` is decided in the loader's planner, where `bool` and `Expr`
+      meet the same `if hidden: continue`; `config` is decided by a preparer
+      the loader hands to the mount, which the kernel calls while it is
+      building the instance's context. Neither is a branch inside the mount
+      path, so an entry without expressions costs nothing.
+  typing_notes:
+    - >-
+      `evaluate` returns `object`; results flow into per-plugin config
+      validation, which is where they acquire a type. The expression layer
+      deliberately does not type-check its own output.
+    - >-
+      `Entry.disabled` widens to `bool | Expr`, so every read of it is a
+      narrowing the type checker enforces — which is what stops the planner
+      from ever treating an unevaluated expression as a truthy "disabled".
+  concurrency:
+    - >-
+      Compilation is cached by source string; evaluation holds no state, so it
+      is safe from any task.
+    - >-
+      A `config` preparer runs at the top of the fiber's load, which is
+      synchronous up to the body's first await and holds the fiber's own gate,
+      so an expression cannot observe a half-built instance and cannot
+      interleave with the body it configures.
+  deviations:
+    - >-
+      The module is `cordis.expr`, not `cordis.loader.expr`: `cordis.loader` is
+      a module rather than a package, and the dependency runs one way — the
+      loader imports the evaluator, the evaluator knows nothing about entries.
+    - >-
+      `register_function` is gone. The allow-list is passed to `evaluate`, and
+      the loader merges anything bound under `FunctionSource.name` over the
+      defaults. Extending the language is therefore a binding in a context,
+      which is reversible and scoped, rather than a mutation of module state,
+      which is neither.
+    - >-
+      Exponentiation is rejected outright. A single `**` can consume unbounded
+      time and memory inside one step, so no step budget can see it coming;
+      sequence repetition (`*`) survives because its cost is charged against
+      the budget by length.
+    - >-
+      Comprehensions and lambdas are rejected entirely rather than restricted
+      to side-effect-free forms. Both introduce name binding, which is the one
+      thing that would make the environment mapping stop being the complete
+      answer to "what can this expression reach".
+    - >-
+      An attribute whose name begins with an underscore is rejected at compile
+      time. Stricter than banning dunders, and the rule is short enough to
+      defend in a review, which is the property that matters for a sandbox.
+    - >-
+      A syntactically invalid expression is a `ConfigIssue` on its field at
+      read time, alongside `disabled: ture` and the rest of the envelope's
+      mistakes, rather than an entry failure at evaluation time. Nothing about
+      the source can make a bad parse succeed later, and read-time rejection is
+      what keeps SEM-001's promise that no entry in a broken file mounts.
+    - >-
+      Writing always emits the portable `{'$expr': '...'}` form, in YAML too;
+      reading accepts both it and the `!expr` tag. One writer and two readers,
+      so a document that survives a round trip in one format survives it in all
+      three.
+    - >-
+      `entries[id]` exposes only the literal part of another entry's config.
+      Reading a field that is itself an expression is an error naming both
+      entries rather than a recursive evaluation, which removes cycles from the
+      language by construction instead of detecting them.
+    - >-
+      SEM-004's config timing is met by a new keyword on the mount API,
+      `prepare`, rather than by teaching the kernel about expressions. The
+      preparer is called from `PluginHandle._run_body`, at the top of the load
+      — after the instance's injections are bound, after isolation and
+      interception are applied, and before the config reaches either the schema
+      or the body — which is the only moment in the lifecycle that satisfies
+      the rule. Not from `_create_context`, which was the first shape tried and
+      is wrong: a fiber builds its environment at construction and again after
+      every unload, both of them moments at which its declared injections may
+      still be unbound. When a preparer is present, config validation moves
+      from the mount call to the load for the same reason, because an
+      expression cannot be validated before it has a value.
+    - >-
+      An instance with a computed config builds its context twice per load,
+      once without the config and once with, and the plugin-mounting rule that
+      one mount yields one child context is read as being about the context the
+      body receives and the tree can reach. The provisional one is built over
+      the same origin as the final one rather than under it, so both see the
+      same realms and the same interception chains — an unlabelled isolation
+      mints a realm per call, and a preparer evaluated against a second realm
+      would be reading a service the body never sees. Nothing registers on the
+      provisional context and no caller is given it.
+    - >-
+      For the same reason the loader's plan-time config pre-check is skipped
+      for an entry whose config contains expressions: `dry_run` still reports
+      an unresolvable target and a malformed envelope, but it cannot report an
+      invalid config it has not computed yet. That entry fails at load instead,
+      through the path every failing body already uses.
+    - >-
+      A `disabled` expression that fails leaves the entry out of the tree and
+      records an `EntryFailure`. "Cannot decide" resolves to "not mounted"
+      rather than to "left as it was", so the tree after a reconcile is always
+      a tree the file could have described.
+
+properties:
+
+  - id: PROP-EXPR-001
+    claim: >-
+      No expression, however constructed, can reach a name, attribute, or
+      callable that was not placed in its environment or its function
+      allow-list.
+    shape: safety
+    evidence: [SEM-002]
+    domain:
+      generates: >-
+        Expression sources built from a grammar that deliberately includes
+        escape attempts: dunder attribute chains, subscripting into type
+        hierarchies, calls to names resembling builtins, comprehension and
+        lambda forms, walrus and star-expressions.
+      strategy_hint: >-
+        Generate from an explicit adversarial grammar rather than from random
+        text; random strings almost never parse, so the discard rate would
+        approach 100 percent and the property would test nothing.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Either the expression is rejected at compile time, or its evaluation
+        touches only objects reachable from the supplied environment —
+        verified by supplying an environment of tracked sentinel objects and
+        asserting no untracked object is returned or observed by a global
+        access spy.
+      independence: >-
+        The sentinel tracking and the access spy are external instrumentation;
+        neither is consulted by the whitelist walk being tested.
+    notes: >-
+      The environment holds `Probe` sentinels whose `__getattr__` and
+      `__getitem__` mint further probes and record every name asked for. The
+      oracle is then two assertions: every recorded attribute name is one the
+      generator wrote, so nothing walked a dunder chain; and any object the
+      evaluation returns is either a probe minted from that environment or an
+      instance of a plain literal type. The allow-list is empty for this
+      property, so a literal cannot have come out of a call.
+    failure_value: >-
+      A whitelist that permits `Attribute` nodes generally, so
+      `x.__class__.__mro__[1].__subclasses__()` reaches arbitrary classes from
+      a config file contributed by a third-party bundle — the classic sandbox
+      escape.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_expr.py::test_no_expression_reaches_outside_its_environment
+
+  - id: PROP-EXPR-002
+    claim: >-
+      Evaluating the same expression twice against the same environment yields
+      equal results and performs no observable side effect.
+    shape: idempotency
+    evidence: [SEM-003]
+    domain:
+      generates: Valid expressions over a generated environment, using only allow-listed functions.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Equality of the two results, plus deep equality of the environment
+        against a pre-evaluation deep copy.
+      independence: "The deep copy is taken by copy.deepcopy before evaluation."
+    failure_value: >-
+      An allow-listed function that mutates a list it is passed, so a `disabled`
+      expression re-evaluated at each mount decision toggles a plugin on and
+      off in a loop.
+    test_tier: local
+    status: passing
+    test_id: tests/test_expr.py::test_evaluating_twice_yields_the_same_and_changes_nothing
+
+  - id: PROP-EXPR-003
+    claim: >-
+      Evaluation terminates within the step budget for every syntactically
+      valid expression, and exceeding the budget raises rather than hangs.
+    shape: safety
+    evidence: [SEM-005]
+    domain:
+      generates: >-
+        Expressions including deeply nested arithmetic, large literal
+        containers, and repeated allow-listed calls sized to straddle the
+        budget.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Every evaluation returns or raises ExpressionError within a wall-clock
+        timeout an order of magnitude above the budget's expected cost.
+      independence: >-
+        The wall-clock timeout is enforced by the test harness, entirely
+        outside the evaluator's own accounting.
+    failure_value: >-
+      A config file from a shipped bundle containing an expression that expands
+      a large literal repeatedly, hanging startup with no error and no way to
+      tell which entry is responsible.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_expr.py::test_evaluation_terminates_inside_its_budget
+
+  - id: PROP-EXPR-004
+    claim: >-
+      An expression appearing in any field other than config or disabled is
+      rejected, naming that field, and no entry in the list is mounted.
+    shape: safety
+    evidence: [SEM-001]
+    domain:
+      generates: Entry lists with expressions placed in generated fields, including nested positions inside group configs.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Mount count zero, and the reported field path equals the generated
+        placement.
+      independence: "The placement is the generator's own choice."
+    failure_value: >-
+      An expression permitted in `name`, so a patch layer can compute which
+      module gets imported — turning configuration into arbitrary code
+      execution by a different route than SEM-002 closes.
+    test_tier: local
+    status: passing
+    test_id: tests/test_expr.py::test_an_expression_outside_config_or_disabled_is_rejected
+
+  - id: PROP-EXPR-005
+    claim: >-
+      Reading a document containing expressions and writing it back without
+      modification produces a document whose expressions are unevaluated and
+      textually identical.
+    shape: roundtrip
+    evidence: [SEM-006]
+    domain:
+      generates: Config documents with expressions at generated valid positions, in each supported serialisation format.
+    preconditions: []
+    oracle:
+      kind: roundtrip
+      description: >-
+        `parse(serialise(parse(text)))` equals `parse(text)`, and the
+        serialised text contains the original expression sources verbatim.
+      independence: >-
+        Round-trip identity is a self-consistency constraint that a
+        freeze-on-read bug cannot satisfy, since the frozen value differs from
+        the source text.
+    notes: >-
+      The serialisation under test is `as_mapping`, which is the loader's own
+      writer, exercised through JSON, TOML and YAML text. Reading accepts the
+      `!expr` tag as well, so the YAML leg is read twice — once from the tag
+      and once from the portable form — and both must land on the same `Expr`.
+    failure_value: >-
+      A config-editing command evaluating expressions on read and writing the
+      results back, so a file that read the port from the environment is
+      permanently pinned to whatever the environment was on the machine that
+      ran the edit.
+    test_tier: local
+    status: passing
+    test_id: tests/test_expr.py::test_a_document_with_expressions_round_trips_unevaluated
+
+  - id: PROP-EXPR-006
+    claim: >-
+      A `config` expression is evaluated exactly once per mount, after its
+      entry's injections are available; a `disabled` expression is evaluated at
+      every mount decision against the loader context.
+    shape: conservation
+    evidence: [SEM-004]
+    domain:
+      generates: >-
+        Entries with generated config and disabled expressions, a generated
+        dependency availability schedule, and a generated number of
+        reconciliations.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Each expression's evaluation environment is captured by an
+        instrumented allow-listed probe function; config evaluations must be
+        one per mount and must see the entry's injected names bound, while
+        disabled evaluations must equal the number of mount decisions and must
+        never see them.
+      independence: >-
+        The probe is a test-supplied allow-listed function recording what it
+        was given, entirely outside the evaluator's own accounting.
+    notes: >-
+      The probe is supplied by binding a `FunctionSource` in the loader's own
+      context, which is also the demonstration that the allow-list is
+      extensible without a global registry. Each entry isolates the service the
+      probe reads, so "saw the entry's own injections" is checked by identity
+      against the isolated instance rather than by name.
+    failure_value: >-
+      Evaluating `config` against the loader context, so an expression
+      referencing an injected service resolves to the outer implementation and
+      the plugin is configured with a handle it was never meant to see.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_expr.py::test_config_is_computed_once_per_mount_and_disabled_at_every_decision
+
+open_questions:
+  - >-
+    Resolved: live service values are exposed to `config` expressions, but only
+    through the allow-listed `service(name)` function and only as a snapshot
+    taken while the instance's context is being built. Because that happens on
+    every load, a reload re-takes the snapshot, so the value cannot go stale
+    behind a restart; and because calls on the result are a compile-time
+    rejection, what a config expression can do with a service is read it.
+  - >-
+    Whether `entries[id]` should ever reach a computed field of another entry.
+    It is an error today, which is defensible and cheap; the alternative is an
+    ordering pass over the entry list, which is a different capability.

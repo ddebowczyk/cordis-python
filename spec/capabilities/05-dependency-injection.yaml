@@ -1,0 +1,564 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: dependency-injection
+title: Dependency injection — continuous, not one-shot
+status: implemented
+tier: 1
+summary: >-
+  A fiber declares the services it requires; the runtime holds it inactive
+  until all are bound, and tears it down and reloads it whenever the set of
+  bound implementations changes — which is the single mechanism behind
+  ordering-independence, provider swap, cascade teardown, and hot reload.
+
+problem:
+  statement: >-
+    Components need capabilities provided by other components whose presence,
+    identity, and lifetime are decided by configuration at runtime. A
+    consumer must never run without what it needs, must never keep a handle to
+    something that has been unloaded, and must not have to know who provides
+    what or in what order things start.
+  without_this:
+    - Startup becomes an explicit ordering problem, and the ordering is encoded
+      in configuration files where it is invisible and easily broken.
+    - Replacing an implementation requires restarting the process, because
+      consumers captured the old object at import or construction time.
+    - Removing a provider leaves consumers holding a dead reference, and the
+      resulting failure surfaces far from the cause.
+  rejected_alternatives:
+    - option: One-shot resolution at construction time.
+      why_rejected: >-
+        Makes the object graph immutable after startup, which forfeits every
+        runtime-composition capability the system exists to provide.
+    - option: Lazy lookup on every call (`ctx.shell.run(...)` each time).
+      why_rejected: >-
+        Still correct, and remains available for optional dependencies, but it
+        gives the consumer no chance to re-establish state when the provider
+        changes — a consumer holding a subscription cannot re-subscribe.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/core/src/fiber.ts
+      symbol: "Fiber._setEpoch, INACTIVE"
+      note: >-
+        The epoch string is built from the uids of the currently-bound
+        implementations of the injected names; any change to that string
+        triggers unload/reload. One mechanism, four user-visible behaviours.
+    - repo: cordis
+      path: packages/core/src/registry.ts
+      symbol: "Inject, Inject.resolve"
+    - repo: kb-docs
+      path: modular-software/cordis-in-22-steps.md
+      symbol: "Steps 7-9"
+
+depends_on: [fiber-lifecycle, service-registry]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      A fiber whose declared required dependencies are not all bound stays
+      PENDING: its plugin body has not run and it has registered nothing.
+    rationale: >-
+      A body that runs before its dependencies exist must either crash or
+      defensively re-check, and both are worse than waiting.
+
+  - id: SEM-002
+    kind: MUST-NOT
+    rule: >-
+      The order in which dependencies become available MUST NOT affect the
+      final state of the tree.
+    rationale: >-
+      This is what allows configuration rows to be listed and started in any
+      order; it is the observable form of plugin-mounting SEM-006.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      When the implementation bound to any injected name changes identity —
+      including removal and re-provision of an equal-but-distinct object — the
+      fiber unloads and, if all dependencies are again available, reloads.
+    rationale: >-
+      Identity, not availability, is the trigger. A consumer that cached
+      handles or subscribed to the old implementation must be given the chance
+      to redo that against the new one.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      Losing a dependency unloads the consumer transitively: everything the
+      consumer mounted is unloaded, and consumers of services the consumer
+      provided are themselves unloaded.
+    rationale: >-
+      Cascade is the correctness requirement; without it a subtree keeps
+      running against a capability that no longer exists.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      Optional dependencies, obtained by explicit lookup rather than
+      declaration, never affect fiber state: their absence does not cause
+      PENDING and their change does not cause reload.
+    rationale: >-
+      "Degrade if absent" and "cannot function without" are different contracts
+      and must be spelled differently at the declaration site.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      A dependency cycle among required declarations leaves every fiber in the
+      cycle PENDING and is reported once, naming the cycle members.
+    rationale: >-
+      Deadlocking silently is the worst outcome; PENDING plus a named cycle is
+      diagnosable.
+
+  - id: SEM-007
+    kind: MUST
+    rule: >-
+      A rapid sequence of dependency changes that ends in the original binding
+      set MUST leave the fiber in the same state it started in, with no
+      accumulated registrations.
+    rationale: >-
+      Flapping providers are normal during configuration reload; the system
+      must converge rather than accrete.
+
+  - id: SEM-008
+    kind: MUST
+    rule: >-
+      Only *declared* provisions take part in cycle detection. A body that
+      would bind a name it never declared cannot be named as a cycle member,
+      and its consumers wait as if nobody provided that name at all.
+    rationale: >-
+      A cycle has to be decidable while every member of it is still PENDING,
+      which is precisely the state in which nothing has been bound. A detector
+      that reasoned from actual bindings would find nothing exactly when the
+      answer matters. The cost is that an undeclared provision is invisible to
+      the diagnosis, which is the same trade the declaration itself makes.
+
+  - id: SEM-009
+    kind: MUST
+    rule: >-
+      An explicit `requires` at the mount site replaces the target's own
+      declaration; it does not extend it.
+    rationale: >-
+      Mounting a third-party plugin against a renamed service is otherwise
+      impossible without editing the plugin. Replacement is also the only rule
+      that can be stated without ambiguity: extension would leave "what happens
+      to a name the target declared and the caller did not" undecided. Because
+      replacement includes replacing with nothing, the parameter's default is
+      `None` rather than `()` — "read the declaration" and "there is no
+      declaration" are different answers and need different spellings.
+
+  - id: SEM-010
+    kind: MUST-NOT
+    rule: >-
+      A cycle MUST NOT be reported while any fiber still has work in flight.
+    rationale: >-
+      During a cascade half the graph is mid-load, and a fiber that will bind
+      its service three turns from now is indistinguishable from one that never
+      will. Reporting at quiescence is what makes the diagnosis true rather
+      than merely timely.
+
+python_design:
+  module: cordis.inject
+  surface:
+    - "INJECT_ATTR: str = \"inject\"              # what a module or class declares with"
+    - "DECLARED_ATTR: str = \"__cordis_inject__\"  # what the decorator writes"
+    - "PROVIDES_ATTR: str = \"provides\"           # what a non-Service target promises"
+    - "Token: TypeAlias = \"str | type[Service]\""
+    - "def inject(*tokens: str | type[Service]) -> Callable[[T], T]: ..."
+    - "def dependencies_of(target: object) -> tuple[str, ...]: ..."
+    - "def provisions_of(target: object) -> tuple[str, ...]: ...   # what it will bind"
+    - "class DependencyCycleError(CordisError):"
+    - "    cycle: tuple[str, ...]        # the members as a path, for reading"
+    - "    names: frozenset[str]         # the members as a set, for comparing"
+    - "# on the fiber, in capability 04's module:"
+    - "    @property\n    def provides(self) -> tuple[str, ...]: ..."
+    - "# on the runtime: the fibers it knows about, and one problem channel"
+    - "    def enrol(self, fiber: Fiber) -> None: ..."
+    - "    def retire(self, fiber: Fiber) -> None: ..."
+    - "    @property\n    def fibers(self) -> tuple[Fiber, ...]: ..."
+    - "    def audit(self) -> None: ...   # look for cycles; run from quiesce()"
+    - "    def report(self, problem: CordisError, *, key: object = None) -> bool: ..."
+    - "    @property\n    def problems(self) -> tuple[CordisError, ...]: ..."
+    - "    def observe_problem(self, listener: ProblemListener) -> Callable[[], None]: ..."
+    - 'def token_label(token: Token, /) -> str   # one spelling of "what is this called"'
+  idioms:
+    - >-
+      Declaration is a module-level `inject = ("shell",)` or a class attribute,
+      mirroring upstream, with `@inject(...)` as the decorator form for
+      functions — three spellings, one normalised representation.
+      `dependencies_of` is the single reader; `PluginHandle.plugin` calls it
+      when the caller passes no explicit `requires`, so the declaration and the
+      fiber-lifecycle seam (capability 04) meet in exactly one place.
+    - >-
+      A class listed in `inject` is normalised to its `name` at declaration
+      time by the registry's own token normaliser, so the typed and stringly
+      forms cannot drift.
+    - >-
+      The epoch is the tuple of currently-bound implementations themselves, in
+      declaration order, compared element-wise with `is`. A change of identity
+      is a reload; a change of value is not.
+    - >-
+      Cycle detection runs over the fibers the runtime knows about, using
+      `graphlib.TopologicalSorter` on the graph "PENDING fiber -> the PENDING
+      fiber that declares it will provide what the first one is missing".
+      Declared *provisions* are what make this decidable before anything runs:
+      a Service subclass names what it binds, so a cycle is visible while every
+      member is still PENDING.
+    - >-
+      A cycle is a condition, not an exception in flight: nobody called
+      anything to provoke it, so there is no caller to raise it at. It is
+      reported once on the runtime's problem channel, deduplicated by its
+      member set, and the members stay PENDING.
+    - >-
+      Two attributes, one reader. `@inject(...)` writes `__cordis_inject__`,
+      which is read first; the plain `inject` attribute is read only if that is
+      absent, and only when its value is a sequence. A module that does
+      `from cordis import inject` in order to decorate a function has bound a
+      *function* to the name a declaration would use, and the sequence check is
+      what keeps that ordinary import from reading as a broken declaration.
+    - >-
+      With an epoch, "the dependency went away" is a special case of "what is
+      behind the name changed" — removing the missing-name branch from
+      `_evaluate` changes no observable behaviour, because the identity check
+      catches the same case. The branch stays because it names the condition
+      SEM-001 is about, and because it does not depend on `None` never being a
+      legitimate bound value.
+    - >-
+      A reported cycle is cut by dropping one of its members and running the
+      sort again, so two unrelated cycles are both reported rather than only
+      the first. A fiber that sits in two cycles is reported once: it is one
+      fiber to fix either way.
+  typing_notes:
+    - >-
+      `ctx.get(cls)` returns `T | None` while `ctx.require(cls)` returns `T`;
+      the distinction is what makes the optional/required contract visible to
+      mypy rather than only to a human reader.
+    - >-
+      `dependencies_of` takes the same `PluginTarget` alias capability 03 uses
+      (`object`, not a Protocol union): a declaration may sit on a function, a
+      class, or a module, and no structural type covers all three without
+      excluding valid targets.
+  concurrency:
+    - >-
+      Re-evaluation triggered by a registry notification is scheduled, not
+      performed inline, so a provider's own registration cannot recurse into a
+      consumer reload while the provider is mid-registration.
+    - >-
+      An epoch is captured at the moment the body is about to run and compared
+      at the next evaluation. Capturing it after the body returns would lose a
+      swap that happened while an asynchronous body was still loading.
+  deviations:
+    - >-
+      The epoch holds the implementations rather than `id()`-based tokens
+      guarded by weak references, as the original design note proposed. Not
+      every object can be weakly referenced — a service may legitimately be a
+      string, a tuple, or an int — so a weakref-guarded token would fail for
+      values the registry accepts. Holding the object is also strictly simpler:
+      `is` cannot be confused by id reuse. The cost is that an ACTIVE consumer
+      keeps the previous implementation alive until its reload completes, which
+      is a window it is running inside anyway.
+    - >-
+      The epoch comparison and the `provides` declaration live in
+      `cordis.fiber`, not in `cordis.inject`. Readiness, identity change and
+      the reload they share are one decision made in one place
+      (`Fiber._evaluate`); splitting them would mean two things could disagree
+      about whether a fiber should be running. `cordis.inject` owns what only
+      it knows: how a target spells its declaration, and how a cycle is found
+      and named.
+    - >-
+      The runtime keeps a register of live fibers (`FiberRuntime.enrol`), which
+      capability 04 did not need. Cycle detection is a question about the whole
+      set of PENDING fibers, not about any one of them, and diagnostics
+      (capability 11) asks the same question of the same register.
+    - >-
+      `DependencyCycleError` keeps the `cycle` path it already had and gains
+      `names` as a frozenset, rather than the planned `members`/`names` pair of
+      tuples. The same cycle can be reported starting from any of its members,
+      so the path is good for reading and useless for deciding whether two
+      reports are the same cycle; one field for each job is enough, and the
+      existing field did not have to change shape.
+    - >-
+      PROP-INJECT-002 permutes the whole mount plan — providers *and*
+      consumers — where the card said "permutations of the same set of provide
+      operations". Permuting only the provides cannot detect the defect the
+      card names: a plan that mounts every consumer before every provider is
+      broken uniformly by an implementation that decides readiness once, and
+      comparing two uniformly broken runs proves nothing. What must not matter
+      is whether a given consumer was mounted before or after what it needs,
+      and only a plan that permutes both says so.
+    - >-
+      PROP-INJECT-004's oracle drops "listener counts" and substitutes the
+      binding set, the count of live fibers, the consumer's effect tree, and
+      the number of times its body ran. A leaked registry subscription turns
+      out not to be observable through behaviour — the re-evaluation guard
+      coalesces the duplicate notification — so a card asserting on it would be
+      asserting on a private attribute. The quantities that replaced it are all
+      externally visible, and each of them is something a flap can accumulate.
+    - >-
+      PROP-INJECT-005's failure value is restated. "Treating `ctx.get()` as an
+      implicit declaration" is not reachable by mutating this implementation:
+      nothing records lookups, so producing that defect would mean writing new
+      machinery rather than breaking existing machinery. The reachable defect
+      at the same seam is `ctx.get` resolving like `ctx.require` — an optional
+      probe that raises instead of answering `None` — which the same
+      differential catches, and which is one keyword away in real code.
+
+properties:
+
+  - id: PROP-INJECT-001
+    claim: >-
+      A fiber's body has run if and only if all of its declared dependencies
+      were bound at the time it ran, for every sequence of provide and remove
+      operations.
+    shape: state-machine
+    evidence: [SEM-001, SEM-004]
+    domain:
+      generates: >-
+        A RuleBasedStateMachine over a plugin set with generated dependency
+        declarations, issuing provide, remove, mount and dispose rules.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Each plugin body records the dependency snapshot it observed on entry;
+        every recorded snapshot must contain all declared names.
+      independence: >-
+        The snapshot is taken by the plugin body itself at the moment of
+        execution, from inside the system under test but at a point the
+        scheduler cannot retroactively adjust; it captures a fact about
+        temporal ordering rather than a recomputed conclusion.
+    failure_value: >-
+      Reading the declaration as advisory — mounting with whatever the caller
+      passed and ignoring what the target declared — so the body runs against a
+      dependency that is not there and fails somewhere unrelated to it.
+    test_tier: pr
+    status: passing
+    test_id: >-
+      tests/test_dependency_injection.py::test_a_body_runs_only_with_every_declared_dependency_bound
+
+  - id: PROP-INJECT-002
+    claim: >-
+      Applying any permutation of the same set of provide operations converges
+      to the same set of active fibers and the same binding set.
+    shape: metamorphic
+    evidence: [SEM-002]
+    domain:
+      generates: >-
+        A mount plan of four providers and 0-4 consumers with generated
+        declarations, plus two permutations of that whole plan.
+      strategy_hint: >-
+        Permute providers and consumers together; declarations are drawn from a
+        fixed name pool, so no cycle can be generated and nothing is filtered.
+    preconditions: []
+    oracle:
+      kind: metamorphic
+      description: >-
+        Canonicalised snapshots of (fiber name -> state) and the binding key
+        set must be equal across the two runs.
+      independence: >-
+        Two independent runs in fresh roots; the only shared input is the
+        generated plan.
+    failure_value: >-
+      Readiness decided once, at mount time — so a consumer mounted before its
+      provider waits forever while an identical one mounted afterwards runs,
+      and which you get depends on the order the mounts were written in.
+    test_tier: pr
+    status: passing
+    test_id: >-
+      tests/test_dependency_injection.py::test_the_order_dependencies_arrive_does_not_change_the_result
+
+  - id: PROP-INJECT-003
+    claim: >-
+      Replacing a provider with a different implementation of the same name
+      causes every declaring consumer to unload and reload exactly once, and
+      every consumer then holds the new implementation.
+    shape: differential
+    evidence: [SEM-003]
+    domain:
+      generates: >-
+        A provider with 1-6 consumers and a generated number of successive
+        replacements. Every replacement is by an equal-valued but distinct
+        object: the services the test mounts compare equal by type, which is
+        the ordinary shape of a service carrying no distinguishing state and
+        the only shape in which identity and equality can disagree.
+      strategy_hint: >-
+        Add one fixed arrangement to the generated ones: a consumer still
+        running its own body while the provider restarts. That is the only
+        case in which the consumer never sees its dependency go missing, so it
+        is the only case an equality comparison could survive.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        Expected reload count per consumer equals the number of replacements,
+        computed by the test; each consumer records the implementation it
+        resolved on each load, and consecutive records must be distinct objects
+        with the last identical to what is bound at the end.
+      independence: >-
+        The expected count comes from the generated plan; the implementations
+        are compared with `is` against objects the test holds itself.
+    failure_value: >-
+      Comparing implementations by equality rather than identity, so swapping
+      in a fresh instance of a stateless-looking service does not reload
+      consumers, and every consumer keeps calling the disposed instance.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_dependency_injection.py::test_replacing_an_implementation_reloads_every_consumer_once
+
+  - id: PROP-INJECT-004
+    claim: >-
+      Any sequence of dependency changes whose net effect is the identity
+      leaves the system in exactly the state it started in.
+    shape: conservation
+    evidence: [SEM-007]
+    domain:
+      generates: >-
+        A balanced sequence: a set of provide/remove pairs applied in generated
+        interleaved order such that the final binding set equals the initial
+        one.
+      strategy_hint: >-
+        Generate the balanced sequence by construction (emit each remove only
+        after its provide, and close all opens at the end) rather than by
+        filtering random sequences.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        The binding set, the count of live fibers, the consumer's effect tree
+        and its state are compared to snapshots taken before the sequence; the
+        number of times the consumer's body ran is compared to the number of
+        plan entries that took away something it declared. Mid-sequence, the
+        consumer must be PENDING while a name it declared is unbound.
+      independence: >-
+        Compares the system against its own earlier snapshot across an
+        operation that is a no-op by construction, and against a count derived
+        from the generated plan — the implementation cannot satisfy either by
+        recomputation, only by actually converging.
+    failure_value: >-
+      Each unload/reload cycle leaving something behind — a fiber the runtime
+      never forgets, an effect registered twice — so a provider that flaps
+      during a config reload accumulates rather than converges, and the symptom
+      is duplicated side effects rather than an error.
+    test_tier: pr
+    status: passing
+    test_id: >-
+      tests/test_dependency_injection.py::test_a_balanced_sequence_of_changes_leaves_the_system_as_it_was
+
+  - id: PROP-INJECT-005
+    claim: >-
+      Optional dependencies never influence fiber state: the same plugin set
+      reaches identical fiber states whether optional services are present,
+      absent, or replaced.
+    shape: differential
+    evidence: [SEM-005]
+    domain:
+      generates: A plugin set with generated required and optional declarations, run under generated presence patterns for the optional names.
+    preconditions: []
+    oracle:
+      kind: metamorphic
+      description: >-
+        Compare the fiber-state snapshot against a run of the same plugin set
+        with all optional declarations removed from the plan.
+      independence: >-
+        The comparison run is a structurally different input processed by the
+        same code path; the property constrains the relationship between the
+        two, which no single-run bug can satisfy accidentally.
+    failure_value: >-
+      An optional lookup that is not optional: `ctx.get` resolving the way
+      `ctx.require` does, so a plugin that merely probes for an approval
+      service FAILS on a deployment that deliberately has none, where the same
+      plugin without the probe is ACTIVE. (Restated; see the deviation.)
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_dependency_injection.py::test_an_optional_lookup_never_changes_a_fiber_state
+
+  - id: PROP-INJECT-006
+    claim: >-
+      A required-dependency cycle leaves all members PENDING, reports the cycle
+      exactly once, and does not prevent unrelated fibers from activating.
+    shape: safety
+    evidence: [SEM-006, SEM-008, SEM-010]
+    domain:
+      generates: >-
+        A dependency graph built as a DAG plus a generated number of added
+        back-edges producing 1-3 cycles, mixed with acyclic components.
+    preconditions:
+      - At least one cycle exists; guaranteed by construction.
+    oracle:
+      kind: model
+      description: >-
+        The test orders the generated graph by hand; what cannot be ordered
+        must be PENDING and everything else ACTIVE. Every reported cycle must
+        be a genuine closed path in the generated edges whose members are all
+        blocked, at least one must be reported, and no member set twice — the
+        audit is run a second time with nothing changed, so "once" is a
+        property of the report rather than of how often the runtime looked.
+      independence: >-
+        The ordering is computed from the generated edges by a loop that shares
+        no code with the runtime's readiness evaluation, and is itself checked
+        against `graphlib.TopologicalSorter`. Reported cycles are validated
+        against the generated graph rather than compared to a second
+        implementation of cycle-finding, which would only agree with itself.
+    failure_value: >-
+      A cycle causing unbounded reload churn — each member repeatedly loading
+      and unloading as the other's binding appears and vanishes — pinning a
+      CPU core with no error message; or the deadlock reported on every pass
+      rather than once, which buries the rest of the log.
+    test_tier: pr
+    status: passing
+    test_id: >-
+      tests/test_dependency_injection.py::test_a_dependency_cycle_pends_its_members_and_is_reported_once
+
+  - id: PROP-INJECT-007
+    claim: >-
+      Mounting a target with an explicit `requires` is indistinguishable from
+      mounting a target that declared those names itself.
+    shape: differential
+    evidence: [SEM-009]
+    domain:
+      generates: >-
+        A declared name set, an override name set, and the set of services
+        actually present — all drawn from the same small pool, so the three
+        overlap in every combination including not at all.
+    preconditions: []
+    oracle:
+      kind: metamorphic
+      description: >-
+        The fiber's state, and the names it reports as required, must equal
+        those of a second run in a fresh host where the same override was
+        written as the target's own declaration.
+      independence: >-
+        The comparison run is a structurally different input — the names move
+        from the mount site to the target — processed by the same code path.
+        No single-run bug can satisfy the relation accidentally.
+    failure_value: >-
+      An explicit `requires` merged with the declaration instead of replacing
+      it, so a plugin pointed at a renamed service still waits for the name it
+      was written for and can be wired to nothing but its original deployment.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_dependency_injection.py::test_an_explicit_requirement_replaces_the_declaration
+
+open_questions:
+  - >-
+    RESOLVED (implementation): a consumer cannot opt out of
+    reload-on-replacement. The opt-out was to be for consumers that hold no
+    state derived from the implementation — but a consumer that resolves its
+    dependency once and keeps the object is exactly the consumer that must
+    reload, and one that resolves it on every call can simply not declare it
+    and use `ctx.get` instead. The lazy-lookup route already covers the case
+    the opt-out was for, without a second rule to reason about. Revisit only
+    with a measured churn problem that lazy lookup cannot solve.
+  - >-
+    Whether cycle detection should run anywhere other than quiescence. An
+    application that never awaits `runtime.quiesce()` never audits, so a
+    deadlocked subtree stays silent. `audit()` is public so a supervisor can
+    ask, and diagnostics (capability 11) is the natural place to decide when it
+    should be asked automatically — but the answer belongs with whatever owns
+    the application's idea of "startup finished", which does not exist yet.

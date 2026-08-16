@@ -1,0 +1,351 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: event-filtering
+title: Event filtering — listener admission decided by the registration context
+status: implemented
+tier: 2
+summary: >-
+  A context may carry a filter that decides, per dispatch, whether listeners
+  registered under it are admitted, which is what lets one shared event bus
+  serve many independent subjects without any listener checking whether an
+  event is "for it".
+
+problem:
+  statement: >-
+    A single process may run many instances of the same thing — several agents,
+    several sessions, several tenants — all publishing to the same event names.
+    Without admission control every listener receives every instance's events
+    and must filter defensively, which is boilerplate that is easy to get wrong
+    and impossible to audit.
+  without_this:
+    - >-
+      Every listener begins with a defensive "if this event is not mine,
+      return" guard, and the one that forgets leaks data across sessions.
+    - Event payloads grow discriminator fields that exist only for filtering.
+    - Cross-subject leakage is undetectable by inspection because admission is
+      distributed across every listener.
+  rejected_alternatives:
+    - option: A separate event bus per subject.
+      why_rejected: >-
+        Prevents global observers (logging, metrics, the session recorder) from
+        seeing everything, which is the other half of the requirement.
+    - option: Topic name suffixed with the subject id.
+      why_rejected: >-
+        Makes global subscription require wildcards, and turns every listener
+        registration into string construction.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/core/src/events.ts
+      symbol: "EventsService._resolve, Context.filter"
+    - repo: deepseek-harness
+      path: packages/core/agent/src/dispatch.ts
+      symbol: "agentCarrier, agentEvents"
+    - repo: kb-docs
+      path: modular-software/cordis-cheatsheet.md
+      symbol: "§5.3 Scoped registration"
+
+depends_on: [event-bus, context-tree]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      A listener is invoked for a dispatch only if the filter carried by its
+      registration context admits that dispatch's carrier context; a
+      registration context with no filter admits everything.
+    rationale: >-
+      Default-open keeps the simple case simple; filtering is opt-in per
+      registration site, not per listener body.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      Filters are evaluated at most once per (dispatch, distinct filter), not
+      once per listener and not once per registration context.
+    rationale: >-
+      A subject with hundreds of listeners must not pay hundreds of predicate
+      calls per event. Counting distinct *filters* rather than distinct
+      contexts is the stronger of the two rules and the one the inheritance
+      model asks for: a filter installed once and inherited by fifty
+      descendants is one rule, and asking it fifty times per dispatch would
+      make inheritance cost exactly what it is supposed to save.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      A listener registered with `global=True` bypasses filtering entirely.
+    rationale: >-
+      Recorders, exporters, and the session log must see every event by
+      construction, and that intent must be visible at the registration site.
+
+  - id: SEM-004
+    kind: MUST-NOT
+    rule: >-
+      A filter MUST NOT be treated as a security boundary. It is a routing
+      mechanism; anything reachable through the registry remains reachable.
+    rationale: >-
+      Stating this prevents the mechanism from being load-bearing for isolation
+      it cannot actually provide — the harness documents the same caveat for
+      its scope keys.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      A filter that raises is treated as denying admission for that dispatch,
+      and the exception is reported on the error channel; it MUST NOT abort the
+      dispatch for other listeners.
+    rationale: >-
+      One malformed predicate must not stop event delivery process-wide.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      Filtering affects only which listeners run. Dispatch-mode semantics —
+      ordering, short-circuit, waterfall chaining — apply to the admitted
+      subset exactly as they would to a bus containing only those listeners.
+    rationale: >-
+      Otherwise a filtered waterfall behaves differently from an unfiltered one
+      with the same effective listeners, and reasoning about pipelines becomes
+      impossible.
+
+python_design:
+  module: cordis.filter
+  surface:
+    - "# cordis.filter:"
+    - "Filter: TypeAlias = \"Callable[[Context], bool]\""
+    - "FILTER_KEY: Final = \"__filter__\""
+    - "def with_filter(ctx: Context, predicate: Filter, /) -> Context: ..."
+    - "def filter_of(ctx: Context) -> Filter | None: ...   # nearest, or None"
+    - "# cordis.events, on the bus:"
+    - "def on(self, event, listener, /, *, scope: EffectScope, prepend: bool = False, ctx: Context | None = None, global_: bool = False) -> EffectHandle: ..."
+    - "def through(self, ctx: Context, /) -> BoundBus: ...   # one context, both roles"
+    - "class BoundBus:   # the same five dispatchers and `on`, carrying a context"
+    - "    def on(self, event, listener, /, *, scope, prepend=False, global_=False) -> EffectHandle: ..."
+    - "    async def emit(self, event, /, *args, **kwargs) -> None: ..."
+    - "    async def parallel(...); async def serial(...); def bail(...); async def waterfall(...)"
+  idioms:
+    - >-
+      The filter lives in the scoped-metadata chain, so a child of a filtered
+      context inherits the filter unless it installs its own — the same
+      inheritance rule as everything else, with no separate lookup path.
+    - >-
+      Per-dispatch memoisation of SEM-002 keys on the *resolved predicate*, not
+      on the registration context: many contexts inherit one filter, so keying
+      on the context would ask the same predicate once per context while keying
+      on the predicate asks it once, full stop. The key is `id(predicate)`, made
+      safe by an `alive` list that holds a reference to every predicate the memo
+      has keyed — an id is unique only among live objects, and the list is what
+      keeps them live for exactly as long as the memo does.
+    - >-
+      `bus.through(ctx)` is what `ctx.on(...)` and `ctx.emit(...)` are upstream:
+      one context playing both roles, registration and carrier. The raw bus
+      keeps working untouched -- `EventBus.on` gained `ctx=` and `global_=`,
+      and the dispatchers gained nothing at all.
+  typing_notes:
+    - >-
+      `global_` is spelled with a trailing underscore since `global` is a
+      keyword; documented prominently because it is the one place the API
+      cannot match upstream's spelling.
+    - >-
+      `BoundBus.on` repeats the bus's five `@overload` declarations rather than
+      forwarding through a loose `(Event, Callable[..., Any])` signature. The
+      bound form is the one applications actually call, and a facade that
+      erased the listener-shape checking would make the typed path the one
+      nobody uses.
+  concurrency:
+    - >-
+      The memo is per-dispatch and never shared across dispatches, so a filter
+      whose answer changes between dispatches is honoured.
+    - >-
+      Admission is computed once, at the top of each dispatcher, from the
+      snapshot that dispatch already froze. A registration arriving mid-dispatch
+      is therefore neither admitted nor half-admitted -- the same rule the bus
+      already had for the listener list itself.
+  deviations:
+    - >-
+      The module is `cordis.filter`, not `cordis.events.filter`: `cordis.events`
+      is a module, and turning it into a package to hold forty lines would move
+      code without telling a reader anything. The dependency runs one way --
+      `events` imports `filter`, `filter` knows only about `Context` -- which is
+      what the nested name was for.
+    - >-
+      A dispatch with no carrier admits every listener; filters are not
+      consulted at all. Upstream cannot reach this case because its bus is
+      always reached through a context; here a caller can hold the raw bus. Of
+      the two available rules, denying would make `bus.emit(...)` silently stop
+      delivering to filtered listeners -- a delivery loss with no error and no
+      log -- while admitting reads as the same default-open principle SEM-001
+      already states for the registration side: absence of a filter, or of
+      anything to filter on, is not a denial. SEM-004 already says a filter is
+      not a security boundary, which is what makes this the safe direction.
+    - >-
+      A filter that raises is reported once per *evaluation*, not once per
+      denied listener, and the report names the predicate rather than the
+      listener. SEM-002 makes evaluation the event that happened; a report per
+      listener would multiply one bad predicate into a hundred identical
+      failures on the error channel, which is how a diagnostic becomes noise.
+    - >-
+      SEM-002 was amended during implementation from "once per distinct
+      registration context" to "once per distinct filter". Inheritance means
+      one installed filter typically covers a whole subtree, and the
+      context-keyed reading would have re-asked it once per node — paying for
+      inheritance instead of being paid by it. The new rule implies the old
+      one, so nothing that satisfied the amendment fails the original;
+      PROP-FILTER-003 was restated to match and now asserts that the set of
+      predicates asked equals the set the registered listeners resolve to, an
+      equality the weaker rule could not express.
+
+properties:
+
+  - id: PROP-FILTER-001
+    claim: >-
+      The set of listeners invoked for a dispatch equals the set whose
+      registration context filter admits the carrier, plus all global
+      listeners.
+    shape: differential
+    evidence: [SEM-001, SEM-003]
+    domain:
+      generates: >-
+        Listeners registered across a generated context tree with generated
+        filters (predicates over a generated tag in the carrier's metadata),
+        a generated subset marked global, and a generated carrier.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The expected set is computed by the test evaluating each generated
+        predicate against the carrier directly.
+      independence: >-
+        The predicates are the test's own callables applied by the test; the
+        bus's memoisation and inheritance walk are not involved.
+    failure_value: >-
+      Inheriting the filter from the *dispatching* context rather than the
+      registering one, which inverts the whole mechanism: a global recorder
+      dispatching on behalf of a subject would filter out every listener.
+    test_tier: local
+    status: passing
+    test_id: tests/test_event_filtering.py::test_exactly_the_admitted_listeners_run
+
+  - id: PROP-FILTER-002
+    claim: >-
+      A filtered dispatch produces the same result as an unfiltered dispatch on
+      a bus containing exactly the admitted listeners, under every dispatch
+      mode.
+    shape: metamorphic
+    evidence: [SEM-006]
+    domain:
+      generates: A listener set with generated filters and generated behaviours, dispatched under each of the five modes.
+    preconditions: []
+    oracle:
+      kind: metamorphic
+      description: >-
+        Build a second bus containing only the listeners the first run
+        admitted, dispatch the same event, and compare results and invocation
+        orders.
+      independence: >-
+        The comparison bus exercises the unfiltered code path; agreement
+        constrains the filtered path against it.
+    failure_value: >-
+      A waterfall whose `next` chain is built before filtering, so a denied
+      listener still occupies a link and the chain returns early with the
+      default because the link never forwards.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_event_filtering.py::test_filtering_only_removes_listeners
+
+  - id: PROP-FILTER-003
+    claim: >-
+      Each distinct filter is evaluated at most once per dispatch, regardless of
+      how many listeners — or how many registration contexts — it covers.
+    shape: conservation
+    evidence: [SEM-002]
+    domain:
+      generates: A generated number of listeners (up to 200) distributed over a generated small number of filtered contexts.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Each predicate records itself when asked; after one dispatch the record
+        is duplicate-free and holds exactly the filters the registered
+        listeners resolve to.
+      independence: >-
+        Counters are inside the test's predicates, invisible to the memoisation
+        logic being checked.
+    failure_value: >-
+      Dropping the memo during a refactor, turning a per-event cost linear in
+      subjects into one linear in listeners — a performance regression that
+      only shows up under load and is invisible to correctness tests.
+    test_tier: nightly
+    status: passing
+    test_id: tests/test_event_filtering.py::test_a_filter_is_asked_once_per_dispatch
+
+  - id: PROP-FILTER-004
+    claim: >-
+      A raising filter denies only its own listeners and leaves every other
+      listener's invocation unchanged.
+    shape: safety
+    evidence: [SEM-005]
+    domain:
+      generates: A listener set where a generated subset of contexts carry raising predicates.
+    preconditions:
+      - At least one predicate raises; guaranteed by construction.
+    oracle:
+      kind: invariant
+      description: >-
+        Listeners under non-raising admitting contexts have invocation count 1;
+        listeners under raising contexts have count 0; the dispatch itself did
+        not raise.
+      independence: >-
+        The raising set is the generator's choice; counts are observed
+        externally.
+    failure_value: >-
+      A predicate exception propagating out of the dispatch loop, so one
+      subject's malformed scope tag stops event delivery for every subject in
+      the process.
+    test_tier: local
+    status: passing
+    test_id: tests/test_event_filtering.py::test_a_raising_filter_denies_only_its_own
+
+  - id: PROP-FILTER-005
+    claim: >-
+      Installing filters changes which listeners are called and nothing about
+      which services a context can resolve — including the contexts whose
+      listeners were just denied.
+    shape: differential
+    evidence: [SEM-004]
+    domain:
+      generates: >-
+        The same generated context tree twice, once with its filters installed
+        and once with every filter removed, plus a carrier tag.
+    preconditions: []
+    oracle:
+      kind: reference
+      description: >-
+        Every (context, service name) pair resolves the same in both trees,
+        while the dispatch in the filtered tree still admits exactly the
+        modelled subset.
+      independence: >-
+        The baseline is the same generated plan with `allow` set to None on
+        every node — a construction of the test, sharing nothing with the
+        filter implementation.
+    failure_value: >-
+      Someone confining a tenant's plugins with a filter on the evidence that
+      the tenant's listeners stopped being called, and shipping it as
+      isolation — the one reading of the mechanism this rule exists to refuse.
+    test_tier: local
+    status: passing
+    test_id: tests/test_event_filtering.py::test_a_filter_routes_dispatch_and_changes_nothing_about_reach
+
+open_questions:
+  - >-
+    RESOLVED (implementation): filters replace rather than compose. The two
+    rules are not symmetric — a caller who wants intersection writes
+    `lambda c: outer(c) and mine(c)` and has it, while under an intersecting
+    rule widening what an ancestor narrowed cannot be written at all. Replacing
+    is therefore the rule that keeps both behaviours reachable, and it is what
+    upstream does. `filter_of` returns the nearest installed filter and stops;
+    `test_a_filter_is_inherited_until_it_is_replaced` is the seam, and a
+    mutant that intersects the whole lineage instead is caught by it.

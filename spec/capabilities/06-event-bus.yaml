@@ -1,0 +1,537 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: event-bus
+title: Event bus — five dispatch modes as explicit contracts
+status: implemented
+tier: 1
+summary: >-
+  A typed event bus where the dispatch mode (emit, parallel, serial, bail,
+  waterfall) is part of each event's declaration, so a listener author knows
+  whether they may return a value, run concurrently, veto, or intercept.
+
+problem:
+  statement: >-
+    Extension points need more than "notify everyone". Some announce, some
+    collect an answer, some let one participant veto, and some wrap the
+    operation itself. Collapsing all of these into a single `emit` forces
+    every extension point to invent its own protocol on top.
+  without_this:
+    - Listeners return values that the dispatcher discards, so a policy plugin
+      appears to work in review and does nothing at runtime.
+    - Interception is impossible without monkeypatching, so cross-cutting
+      concerns (approval, logging, retries) must be baked into each caller.
+    - One slow or throwing listener starves the rest, because nothing specifies
+      whether listeners are isolated.
+  rejected_alternatives:
+    - option: A single async broadcast with listeners appending to a shared list.
+      why_rejected: >-
+        Turns ordering and short-circuit semantics into an unwritten convention
+        per event, which is exactly the ambiguity the mode enum removes.
+    - option: Python's stdlib-free observer pattern per service.
+      why_rejected: >-
+        Each service reimplements registration, disposal, and error containment
+        slightly differently; centralising them is most of the value.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/core/src/events.ts
+      symbol: "EventsService.emit, parallel, serial, bail, waterfall, register"
+    - repo: deepseek-harness
+      path: docs/user/develop/framework/events.md
+    - repo: kb-docs
+      path: modular-software/cordis-cheatsheet.md
+      symbol: "§3 Events"
+
+depends_on: [context-tree, effect-scope]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      Every event declares exactly one dispatch mode, and dispatching it under
+      any other mode raises `EventModeError`.
+    rationale: >-
+      The mode is the contract. Allowing a caller to pick makes listener
+      authors guess.
+    deviation:
+      upstream: >-
+        Upstream lets any name be dispatched under any of the five methods;
+        the mode is documented in JSDoc and checked by a separate lint.
+      rationale: >-
+        Binding the mode to the event declaration makes the check structural
+        and free, and gives the Python typing system something to hang the
+        listener signature off.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      `on(event, listener)` returns a disposer and registers as an effect on
+      the calling scope, so a listener never outlives its registrant.
+    rationale: Same discipline as every other registration.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      Listeners are invoked in registration order, except that listeners
+      registered with `prepend=True` are invoked before all non-prepended ones,
+      in reverse order of their own registration.
+    rationale: >-
+      Deterministic order is required for waterfall composition to be
+      reasonable about; prepend is how a plugin gets in front of listeners
+      registered before it existed.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      Under `emit`, all listeners run and their return values are discarded;
+      an exception from one listener does not prevent the others from running,
+      and all exceptions are surfaced to the error channel rather than to the
+      caller.
+    rationale: >-
+      A broadcast whose delivery depends on every previous listener succeeding
+      is not a broadcast.
+    deviation:
+      upstream: >-
+        Upstream `emit` maps over listeners synchronously, so one throw starves
+        every later listener.
+      rationale: >-
+        That is a known upstream sharp edge, documented as a footgun. Since
+        this is a reimplementation and not a port of bug-for-bug behaviour, the
+        containment is specified in.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      Under `parallel`, listeners run concurrently and the dispatch awaits all
+      of them; failures are collected and raised as one `ExceptionGroup` after
+      every listener has settled.
+    rationale: Concurrency without a barrier is a fire-and-forget in disguise.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      Under `serial` and `bail`, listeners run in order and dispatch stops at
+      the first listener returning a value that is not None; that value is the
+      result. `serial` awaits listeners, `bail` does not.
+    rationale: >-
+      "First answer wins" is the shape of a resolver chain; None as the
+      abstain value is unambiguous in Python in a way that JS's falsy check
+      is not.
+    deviation:
+      upstream: "Upstream treats null, false and undefined as abstain."
+      rationale: >-
+        In Python `False` and `0` are legitimate answers. Only None abstains.
+
+  - id: SEM-007
+    kind: MUST
+    rule: >-
+      Under `waterfall`, each listener receives the event arguments plus a
+      `next` callable; calling `next()` invokes the remainder of the chain and
+      returns its result. The innermost default is supplied by the dispatcher.
+    rationale: Around-middleware is the interception primitive.
+
+  - id: SEM-008
+    kind: MUST
+    rule: >-
+      A waterfall listener that returns without calling `next` short-circuits
+      the chain. This is legitimate for a listener that decides the outcome,
+      and a defect for a listener that only observes.
+    rationale: >-
+      The single most common bug in this style of system: a logging listener
+      that forgets `next()` silently deletes the default behaviour for
+      everyone downstream.
+
+  - id: SEM-009
+    kind: MUST
+    rule: >-
+      A waterfall listener MUST NOT call `next` more than once; a second call
+      raises `NextCalledTwiceError`.
+    rationale: >-
+      Re-entering the downstream chain duplicates side effects with no way for
+      downstream listeners to notice.
+
+  - id: SEM-010
+    kind: MUST
+    rule: >-
+      Disposing a listener during a dispatch it participates in does not
+      affect the in-flight dispatch; the disposal takes effect for subsequent
+      dispatches.
+    rationale: >-
+      Mutating the listener list mid-iteration is the classic source of skipped
+      listeners; snapshotting is the only safe rule.
+
+  - id: SEM-011
+    kind: MUST
+    rule: >-
+      A `bail` listener that returns an awaitable raises `EventModeError`
+      naming the awaitable as the reason; the awaitable is closed and no later
+      listener runs.
+    rationale: >-
+      SEM-006 says `bail` does not await, so an async listener on a bail event
+      has no correct outcome: returning the coroutine object would make it the
+      "answer" — a truthy value that stops the chain and is never run — and
+      awaiting it would make the synchronous dispatch site asynchronous. This
+      rule was added during implementation, when `bail` turned out to need an
+      answer for a case the original ten rules left open.
+
+python_design:
+  module: cordis.events
+  surface:
+    - "class Emit(Generic[P]): name: str"
+    - "class Parallel(Generic[P]): name: str"
+    - "class Serial(Generic[P, R]): name: str"
+    - "class Bail(Generic[P, R]): name: str"
+    - "class Waterfall(Generic[P, R]): name: str"
+    - "def on(self, event: Emit[P], listener: Callable[P, Any], /, *, scope: EffectScope, prepend: bool = False) -> EffectHandle: ..."
+    - "def on_error(self, handler: Callable[[ErrorReport], None]) -> Callable[[], None]: ..."
+    - "def listeners(self, event: Event) -> tuple[Callable[..., Any], ...]: ..."
+    - "async def emit(self, event: Emit[P], /, *args: P.args, **kw: P.kwargs) -> None: ..."
+    - "async def parallel(self, event: Parallel[P], /, *args: P.args, **kw: P.kwargs) -> None: ..."
+    - "async def serial(self, event: Serial[P, R], /, *args: P.args, **kw: P.kwargs) -> R | None: ..."
+    - "def bail(self, event: Bail[P, R], /, *args: P.args, **kw: P.kwargs) -> R | None: ..."
+    - "async def waterfall(self, event: Waterfall[P, R], default: Callable[[], R], /, *args: P.args, **kw: P.kwargs) -> R: ..."
+    - "class EventBus:   # the raw bus; `BoundBus` is what a context hands out"
+    - "class Next(Protocol):   # what a waterfall listener is handed to continue the chain"
+    - "class EventModeError(CordisError, TypeError): event, wanted, got"
+    - "class NextCalledTwiceError(CordisError, RuntimeError): event, listener"
+  idioms:
+    - >-
+      Events are module-level generic descriptor objects, e.g.
+      `TOOL_EXECUTE: Waterfall[[ToolCall], ToolResult] = Waterfall("tools/execute")`.
+      This is the Python answer to TypeScript declaration merging: the object
+      carries both the wire name (for config and diagnostics) and the listener
+      signature (for mypy), and `on()` overloads per event class make a
+      mismatched listener a type error rather than a runtime surprise.
+    - >-
+      `ParamSpec` + `Concatenate` type the waterfall `next` parameter, so a
+      listener that omits `next` fails type checking — turning SEM-008's
+      footgun into a static error for the common case.
+    - >-
+      Listener lists are stored as immutable tuples and replaced on mutation,
+      which makes SEM-010's snapshot rule free rather than a copy per dispatch.
+  typing_notes:
+    - >-
+      Five event classes rather than one with a mode field, because only
+      distinct classes let `on()` and the dispatch methods be overloaded per
+      mode; SEM-001 then holds by construction for typed call sites and is
+      enforced at runtime for dynamic ones.
+    - >-
+      `waterfall`'s `default` is positional-only and precedes the event
+      arguments. The signature this record first proposed put it keyword-only
+      between `*args: P.args` and `**kw: P.kwargs`, which is not expressible:
+      a `ParamSpec`-typed signature admits no parameter after `*args`, and
+      mypy rejects it outright. Recorded here rather than silently changed in
+      the source, since the call shape is public.
+  concurrency:
+    - >-
+      `emit` awaits each listener in turn rather than scheduling it: a
+      coroutine returned by an `Emit` listener is awaited before the next
+      listener runs, and any failure is contained and routed to the error
+      channel (SEM-004). The alternative reading — fire the coroutines onto the
+      loop and return — makes "delivered" unobservable, so a test could not
+      state PROP-EVENT-003 at all and a caller could not know when the
+      broadcast finished. `parallel` remains the mode that says "concurrently";
+      `emit` says "to everyone, failures contained".
+    - >-
+      Nothing in the bus creates a task or a background lifetime of its own, so
+      cancelling a dispatch cancels exactly the listeners it is inside, and the
+      registration side is entirely synchronous.
+
+properties:
+
+  - id: PROP-EVENT-001
+    claim: >-
+      Under every dispatch mode, the set of listeners invoked equals exactly
+      the set registered and not yet disposed at the moment dispatch began.
+    shape: conservation
+    evidence: [SEM-002, SEM-010]
+    domain:
+      generates: >-
+        A sequence of register and dispose operations interleaved with
+        dispatches, including registrations and disposals performed from
+        inside listeners.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        A list model maintained by the test records the live listener set; at
+        each dispatch the expected invocation set is snapshotted from the model
+        before the dispatch runs.
+      independence: >-
+        The model is maintained from the operations the test issued, not from
+        the bus's own listener storage.
+    failure_value: >-
+      A listener that disposes itself during dispatch causing the iteration to
+      skip the following listener — an off-by-one that only appears when a
+      one-shot handler is registered next to a permanent one.
+    test_tier: local
+    status: passing
+    test_id: tests/test_events.py::test_dispatch_invokes_exactly_the_listeners_live_when_it_began
+
+  - id: PROP-EVENT-002
+    claim: >-
+      Listener invocation order equals registration order, with prepended
+      listeners first in reverse registration order.
+    shape: differential
+    evidence: [SEM-003]
+    domain:
+      generates: 1-20 listeners with generated prepend flags, registered in generated order.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The expected order is computed by the test as
+        `list(reversed(prepended)) + normal`, from its own registration log.
+      independence: >-
+        Six lines of list arithmetic derived from the written rule, sharing no
+        code with the bus.
+    failure_value: >-
+      Implementing prepend with `list.insert(0, ...)` inside a shared list, so
+      two prepending plugins end up in registration order rather than reverse —
+      making "get in front of everyone" depend on load order.
+    test_tier: local
+    status: passing
+    test_id: tests/test_events.py::test_invocation_order_is_registration_order_with_prepends_reversed
+
+  - id: PROP-EVENT-003
+    claim: >-
+      Under emit and parallel, every registered listener is invoked exactly
+      once regardless of how many listeners raise.
+    shape: safety
+    evidence: [SEM-004, SEM-005]
+    domain:
+      generates: >-
+        A listener set with a generated subset raising marker exceptions, and a
+        generated subset being async.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Per-listener invocation counters are all exactly 1 after dispatch
+        settles, and for parallel the ExceptionGroup contains precisely the
+        markers of the raising subset.
+      independence: >-
+        Counters are written by the listeners; the expected raising set is the
+        generator's choice made before the run.
+    failure_value: >-
+      Iterating listeners with a single try/except around the loop, so the
+      first raising listener silently cancels delivery to every later one —
+      an audit-log listener registered last never seeing an event because an
+      unrelated metrics listener threw.
+    test_tier: local
+    status: passing
+    test_id: tests/test_events.py::test_every_listener_runs_once_however_many_raise
+
+  - id: PROP-EVENT-004
+    claim: >-
+      Under serial and bail, the result is the first non-None listener return,
+      and no listener after that one is invoked.
+    shape: safety
+    evidence: [SEM-006]
+    domain:
+      generates: >-
+        A listener sequence with generated return values drawn from None,
+        False, 0, empty string, and non-empty values, so falsy-but-present
+        answers occur frequently.
+      strategy_hint: >-
+        Sample return values from an explicit list including every falsy
+        non-None value; a naive `st.integers() | st.none()` almost never
+        produces the interesting case.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The expected result and cutoff index are computed by the test as the
+        first index whose planned return is not None.
+      independence: >-
+        Derived from the generated plan before execution.
+    failure_value: >-
+      Using truthiness instead of an `is not None` check, so a policy listener
+      returning `False` ("deny") is treated as abstention and the next listener
+      silently allows the operation.
+    test_tier: local
+    status: passing
+    test_id: tests/test_events.py::test_the_first_non_none_answer_wins_and_stops_the_chain
+
+  - id: PROP-EVENT-005
+    claim: >-
+      A waterfall chain in which every listener calls next exactly once returns
+      the dispatcher's default value transformed by each listener's wrapper, in
+      strict onion order.
+    shape: differential
+    evidence: [SEM-007]
+    domain:
+      generates: >-
+        1-12 listeners each applying a generated pure string transformation
+        around `next()`, plus a generated default value.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The expected result is computed by folding the transformations in the
+        test with plain function composition over the default.
+      independence: >-
+        Function composition in the test is a different construction than the
+        bus's chain-building, and the transformations are non-commutative by
+        construction so order errors cannot cancel out.
+    failure_value: >-
+      Building the chain by reducing in the wrong direction, so listeners wrap
+      in registration order on the way out instead of the way in — reversing
+      the nesting of every interceptor without changing any single result in
+      an obvious way.
+    test_tier: local
+    status: passing
+    test_id: tests/test_events.py::test_a_full_waterfall_composes_in_onion_order
+
+  - id: PROP-EVENT-006
+    claim: >-
+      A waterfall listener that returns without calling next prevents every
+      downstream listener and the default from running, and its value is the
+      dispatch result.
+    shape: safety
+    evidence: [SEM-008]
+    domain:
+      generates: A waterfall chain with a generated short-circuit index and a generated short-circuit value.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Listeners at indices after the short-circuit point have invocation
+        count 0, the default's invocation count is 0, and the result is the
+        short-circuit value.
+      independence: >-
+        Invocation counters are external to the chain-building logic.
+    failure_value: >-
+      Running the default unconditionally after the chain, so an approval
+      listener that denies an operation returns "denied" while the operation
+      still executes.
+    test_tier: local
+    status: passing
+    test_id: tests/test_events.py::test_a_listener_that_skips_next_short_circuits_the_chain
+
+  - id: PROP-EVENT-007
+    claim: >-
+      Calling next twice in a waterfall listener raises NextCalledTwiceError
+      and does not invoke the downstream chain a second time.
+    shape: safety
+    evidence: [SEM-009]
+    domain:
+      generates: A waterfall chain with a generated listener index that calls next twice.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Downstream listener invocation counts are 1, and the error propagates
+        to the dispatch caller.
+      independence: >-
+        Counters observe the side effect; the error observes the guard. Both
+        must hold, so a guard that raises after already re-entering fails.
+    failure_value: >-
+      A retry-style listener that calls next again on failure, silently
+      re-executing a non-idempotent downstream tool call and producing
+      duplicate writes.
+    test_tier: local
+    status: passing
+    test_id: tests/test_events.py::test_calling_next_twice_raises_and_does_not_re_enter
+
+  - id: PROP-EVENT-008
+    claim: >-
+      Disposing the scope that registered a listener removes it from all
+      subsequent dispatches of that event.
+    shape: safety
+    evidence: [SEM-002]
+    domain:
+      generates: Listeners registered on a generated tree of nested scopes, with a generated dispose order.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        After each disposal, dispatch and assert that invocation counters of
+        listeners belonging to disposed scopes did not increase.
+      independence: >-
+        Scope membership is the test's own construction record.
+    failure_value: >-
+      Listener registration bypassing the effect scope for performance, so
+      unloading a plugin leaves its handlers subscribed and every reload
+      multiplies handling.
+    test_tier: local
+    status: passing
+    test_id: tests/test_events.py::test_disposing_a_scope_unsubscribes_its_listeners
+
+  - id: PROP-EVENT-009
+    claim: >-
+      Dispatching an event under a mode other than its declared one raises
+      EventModeError and invokes no listener.
+    shape: safety
+    evidence: [SEM-001]
+    domain:
+      generates: An event declared under a generated mode, dispatched under each of the other four modes, with listeners registered.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Listener invocation counters are 0 and the raised error names both the
+        declared and the attempted mode.
+      independence: >-
+        Counters observe delivery, a fact independent of the guard that
+        produces the error.
+    failure_value: >-
+      A dynamic dispatch site emitting a waterfall event, so every interceptor
+      runs with a `next` that is never supplied and the pipeline's default
+      behaviour is silently replaced by None.
+    test_tier: local
+    status: passing
+    test_id: tests/test_events.py::test_dispatching_under_the_wrong_mode_raises_and_delivers_nothing
+
+  - id: PROP-EVENT-010
+    claim: >-
+      An async listener on a bail event raises EventModeError at the point that
+      listener is reached, and no listener registered after it runs.
+    shape: safety
+    evidence: [SEM-011]
+    domain:
+      generates: >-
+        A bail chain with a generated index at which the listener is a
+        coroutine function, and generated abstain/answer returns around it.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Listeners before the async one have invocation count 1, listeners after
+        it have 0, and the error names the offending mode pair.
+      independence: >-
+        The offending index is the generator's choice, made before the run;
+        counters are written by the listeners.
+    failure_value: >-
+      Returning the un-awaited coroutine as the answer, so a bail chain "gets
+      an answer" that is a coroutine object — truthy, never executed, and
+      reported by asyncio as "coroutine was never awaited" from a line
+      unrelated to the listener that produced it.
+    test_tier: local
+    status: passing
+    test_id: tests/test_events.py::test_an_async_listener_on_a_bail_event_is_rejected
+
+open_questions:
+  - >-
+    DEFERRED: whether `bail` (synchronous serial) earns its place in Python.
+    Upstream needs it because some dispatch sites are synchronous; if every
+    dispatch site here is async, `bail` collapses into `serial` and the mode
+    count drops to four. Still deferred until the loader and tool pipeline are
+    specified, since they are the sites that would need it. Implementation note:
+    `bail` is implemented, and SEM-011 was added because it needed an answer for
+    an async listener; if `bail` is dropped later, SEM-011 and PROP-EVENT-010 go
+    with it.
+  - >-
+    RESOLVED (implementation): a contained failure with no error handler
+    installed prints its traceback to stderr rather than being dropped. `emit`
+    deliberately withholds failures from the dispatching caller (SEM-004), so
+    the error channel is the only place they can still be seen; silence would
+    make a broken listener invisible in exactly the mode that promises delivery.
+  - >-
+    RESOLVED (implementation): `next` is guarded per invocation, not per
+    listener. The guard lives in a closure created for each step of each
+    dispatch, so dispatching the same chain twice gives each dispatch its own
+    single use of `next` — a flag on the registration would let the first
+    dispatch spend the second's.

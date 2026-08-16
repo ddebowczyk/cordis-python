@@ -1,0 +1,315 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: service-interception
+title: Service interception — per-subtree configuration of a shared service
+status: implemented
+tier: 2
+summary: >-
+  `ctx.intercept(name, config)` returns a child context whose calls into a
+  shared service carry accumulated per-subtree configuration, so one instance
+  can behave differently for different callers without being duplicated.
+
+problem:
+  statement: >-
+    Isolation solves "this subtree needs its own instance". The commoner case
+    is "this subtree needs the same instance to behave slightly differently" —
+    a stricter timeout, a different base path, a tag on every request — and
+    duplicating the instance for that is wasteful and often wrong, because the
+    instance owns a shared resource such as a connection pool.
+  without_this:
+    - Every call site must pass the same options, so the options are
+      duplicated and drift.
+    - Cross-cutting per-subtree defaults require either a new service instance
+      or a global mutable setting.
+    - The alternative — a wrapper service per variation — multiplies the number
+      of registered names and confuses dependency declarations.
+  rejected_alternatives:
+    - option: Deep-merge a config dict at each level.
+      why_rejected: >-
+        Deep merge is ambiguous for lists and for explicit nulls, and it makes
+        "what is my effective config" unanswerable without running the merge.
+        Accumulating an ordered chain that the service resolves explicitly is
+        inspectable.
+    - option: Pass options at every call.
+      why_rejected: >-
+        Remains available and is the right choice for per-call options; the
+        problem being solved is per-subtree *defaults*.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/core/src/context.ts
+      symbol: "Context.intercept, Context.intercept symbol key"
+    - repo: cordis
+      path: packages/core/src/service.ts
+      symbol: "Service[symbols.resolveConfig]"
+      note: >-
+        Upstream merges intercept entries ancestor-first and hands the merged
+        result to the service's own resolveConfig, so the service decides what
+        merging means.
+    - repo: kb-docs
+      path: modular-software/cordis-cheatsheet.md
+      symbol: "§2.3 intercept"
+
+depends_on: [service-registry, context-tree]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      `ctx.intercept(name, config)` returns a child context; the parent's
+      interception chain for that name is unchanged.
+    rationale: Same derivation-not-mutation rule as the context tree.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      The interception chain visible at a context is the ordered sequence of
+      entries contributed by its ancestors, outermost first, followed by its
+      own.
+    rationale: >-
+      Order must be defined and outermost-first, so a nested subtree's entry is
+      the one that wins under any last-wins resolution.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      The service, not the framework, resolves the chain into an effective
+      configuration; the framework supplies the ordered chain and a default
+      resolver that performs a shallow last-wins merge of mappings.
+    rationale: >-
+      Only the service knows whether two entries should merge, replace, or
+      concatenate. A framework-imposed merge is wrong for at least one service.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      Interception affects only the configuration a service observes for a
+      caller; it MUST NOT change which implementation the caller resolves.
+    rationale: >-
+      Interception and isolation are separate axes; conflating them makes both
+      unpredictable.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      A context with an empty interception chain observes exactly the service's
+      own default configuration.
+    rationale: >-
+      The uninterrupted path must be free of surprises, or every service author
+      has to reason about the framework's neutral element.
+
+python_design:
+  module: cordis.intercept
+  surface:
+    - "# added to cordis.registry, so one rule turns a token into a name:"
+    - "def service_name(token: object, *, subject: object = None) -> str: ..."
+    - "# cordis.intercept:"
+    - "Interception: TypeAlias = \"Mapping[str | type[Service], Mapping[str, object]]\""
+    - "INTERCEPT_KEY: Final = \"__intercept__\""
+    - "def intercept_key(name: str) -> str: ...    # \"__intercept__:shell\""
+    - "def intercept(ctx: Context, name: str | type[Service], config: Mapping[str, object], /) -> Context: ..."
+    - "def intercept_all(ctx: Context, entries: Interception, /) -> Context: ..."
+    - "def interceptions(ctx: Context, name: str | type[Service], /) -> tuple[Mapping[str, object], ...]: ...  # outermost first"
+    - "def intercepted_names(ctx: Context) -> frozenset[str]: ...   # for diagnostics"
+    - "def merge_interceptions(chain: Sequence[Mapping[str, object]], /) -> Mapping[str, object]: ..."
+    - "def effective_config(ctx: Context, service: object, /, *, name: str | type[Service] | None = None) -> Mapping[str, object]: ..."
+    - "# what a service may define; both are optional and duck-typed:"
+    - "class InterceptResolver(Protocol):"
+    - "    def resolve_interceptions(self, chain: Sequence[Mapping[str, object]], /) -> Mapping[str, object]: ..."
+    - "#   defaults: Mapping[str, object]     -- used when there is no resolver"
+    - "# the mount seam, in cordis.plugin:"
+    - "def plugin(self, target, config=None, /, *, requires=None, isolate=(), intercept: Interception = {}) -> PluginHandle: ..."
+  idioms:
+    - >-
+      One key per intercepted name in the ordinary scoped-metadata chain
+      (`__intercept__:shell`), carrying *this node's* entry and nothing else.
+      `interceptions` walks the lineage collecting the entries it finds and
+      reverses the walk, so the chain reads outermost-first (SEM-002) while
+      `intercept` costs one `extend` and copies nothing. This is the same shape
+      service-isolation uses for realms; a reader of one can read the other.
+    - >-
+      Each entry is frozen on the way in -- `MappingProxyType(dict(config))`.
+      The caller keeps a reference to the dict it passed, and a chain that
+      changed under a service because someone mutated that dict later would be
+      the least debuggable bug this capability could ship.
+    - >-
+      Interception is opt-in and duck-typed, exactly as `ConfigSchema` is: a
+      service that wants to fold the chain its own way defines
+      `resolve_interceptions`, and a service that does not gets
+      `merge_interceptions` over its `defaults` attribute. Nothing is added to
+      the `Service` base class, so a service that never heard of interception
+      keeps working and a service that is not a `Service` subclass can still
+      take part.
+    - >-
+      Interception is declared at the mount as well
+      (`ctx.plugin(target, intercept={"shell": {...}})`) for the reason
+      isolation is: an instance rebuilds its context on every reload, so an
+      interception held only by the caller's context object would be lost the
+      first time the instance restarted.
+  typing_notes:
+    - >-
+      `effective_config` returns `Mapping[str, object]`, not a `TypedDict` or a
+      generic: the chain is assembled from entries written by *other* subtrees,
+      so the static type of the merge is honestly "some mapping". A service that
+      wants a typed view resolves and then validates through the same
+      `ConfigSchema` protocol `config-validation` uses, which keeps one
+      validation story rather than two.
+    - >-
+      The service argument is typed `object`. It is duck-typed on two optional
+      attributes, and a protocol with all-optional members states nothing; the
+      annotation that tells the truth is the one that admits anything and
+      documents what is looked for.
+  concurrency:
+    - >-
+      A context's own entry is written once, at `extend` time, and frozen; the
+      chain is therefore immutable per context and resolution is safe on any
+      task without synchronisation. `effective_config` reads the chain and folds
+      it with no await in between, so a mount happening concurrently cannot be
+      half-visible to a resolution in progress.
+  deviations:
+    - >-
+      `intercept` and `interceptions` are functions taking the context, not
+      methods on it, for the reason recorded in `service-isolation`:
+      `Context.__getattr__` resolves service names, so every method added to
+      `Context` is a name an application can no longer use. `intercept` is a
+      particularly bad one to take -- it is a plausible service name.
+    - >-
+      The default resolver is not a method on `Service` with an overridable
+      body, as the surface first read, but a module-level function the framework
+      falls back to. A base-class method would have made interception something
+      every service inherits whether or not it participates, and would have put
+      a merge policy on the class that owns service *identity*. SEM-003 is
+      unchanged: the service still decides, it just says so by defining
+      `resolve_interceptions` rather than by overriding it.
+    - >-
+      `cordis.registry` grows `service_name`, and `inject` and `realm` are
+      rewritten to call it. Three modules had each grown a private `_name_of`
+      with the same two rules and different exceptions; a fourth copy for
+      interception would have made "what is this token called" a question with
+      four answers. The consolidated one raises `InvalidPluginError`, which is a
+      `TypeError`, so the isolation path's previous `TypeError` still catches.
+
+properties:
+
+  - id: PROP-INTC-001
+    claim: >-
+      The interception chain observed at any node equals the concatenation of
+      the entries contributed along the path from the root to that node, in
+      that order.
+    shape: differential
+    evidence: [SEM-001, SEM-002]
+    domain:
+      generates: A context tree with generated intercept calls at generated nodes over a small name alphabet.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The test walks its own construction record from root to node,
+        collecting entries for the queried name.
+      independence: >-
+        The model is a list append over the generated plan and never consults
+        the runtime's chain storage.
+    failure_value: >-
+      Building the chain by walking child-to-root and forgetting to reverse, so
+      an outer subtree's default overrides the inner subtree's explicit
+      override — the opposite of what every reader expects.
+    test_tier: local
+    status: passing
+    test_id: tests/test_service_interception.py::test_the_chain_reads_from_the_root_down
+
+  - id: PROP-INTC-002
+    claim: >-
+      Interception never changes which implementation object a context
+      resolves for the intercepted name.
+    shape: metamorphic
+    evidence: [SEM-004]
+    domain:
+      generates: A provider set plus generated intercept calls, with lookups performed in both the intercepted child and its parent.
+    preconditions: []
+    oracle:
+      kind: metamorphic
+      description: >-
+        `child.require(name) is parent.require(name)` for every intercepted
+        name.
+      independence: >-
+        Identity comparison across two contexts that differ only by the
+        interception.
+    failure_value: >-
+      Implementing interception by binding a configured wrapper into the child
+      realm, which quietly turns every interception into an isolation and
+      breaks provider-swap reload for the subtree.
+    test_tier: local
+    status: passing
+    test_id: tests/test_service_interception.py::test_interception_never_changes_which_object_is_resolved
+
+  - id: PROP-INTC-003
+    claim: >-
+      With an empty chain, the effective configuration a service observes
+      equals its declared default.
+    shape: safety
+    evidence: [SEM-005]
+    domain:
+      generates: Services with generated default configurations, resolved from non-intercepting contexts.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: "Equality against the service's declared default, captured at construction."
+      independence: "Compares to a value the test supplied to the service."
+    failure_value: >-
+      A default resolver that returns an empty mapping rather than the
+      service's default when the chain is empty, so every un-intercepted caller
+      silently gets zeros instead of configured defaults.
+    test_tier: local
+    status: passing
+    test_id: tests/test_service_interception.py::test_an_unintercepted_caller_sees_the_declared_default
+
+  - id: PROP-INTC-004
+    claim: >-
+      Under the default shallow last-wins resolver, the effective configuration
+      equals a ChainMap over the reversed chain.
+    shape: differential
+    evidence: [SEM-003]
+    domain:
+      generates: Chains of 0-6 mappings over a shared small key alphabet, with deliberate key overlap and explicit None values.
+      strategy_hint: >-
+        Draw keys from a 4-symbol alphabet and include None as a value so the
+        "explicit null" case, which naive merges mishandle, occurs often.
+    preconditions: []
+    oracle:
+      kind: model
+      description: "`dict(collections.ChainMap(*reversed(chain)))` computed in the test."
+      independence: >-
+        ChainMap is stdlib and predates the specification; a merge bug cannot
+        be mirrored in it.
+    failure_value: >-
+      A merge that skips entries whose value is None, so a subtree cannot
+      explicitly clear an inherited setting and instead silently inherits it.
+    test_tier: local
+    status: passing
+    test_id: tests/test_service_interception.py::test_the_default_resolver_is_shallow_last_wins
+
+open_questions:
+  - >-
+    RESOLVED (implementation): whether interception entries should be validated
+    against the service's config schema at `intercept()` time rather than at
+    resolution time. Validation stays at resolution. An entry is a *fragment* --
+    it says what this subtree changes, not what the service needs -- so
+    validating it against the whole schema would reject correct entries, and a
+    partial-validation mode would be a second schema semantics for the sake of
+    an error location. The service also cannot be consulted at `intercept()`
+    time: a subtree may intercept a name nothing has provided yet, which is
+    ordinary in a tree that mounts concurrently. `resolve_interceptions` is the
+    place where a service that wants validation gets a *complete* config to
+    validate, through the same `ConfigSchema` protocol `config-validation`
+    already defines, and the entry that caused a rejection is visible in the
+    chain the resolver was handed.
+  - >-
+    Whether `effective_config` should be memoised per (context, service). The
+    fold is O(depth of interceptions) and runs on every call a service makes on
+    behalf of a caller, which is the one place in this capability that could
+    show up in a profile. Deferred deliberately: a cache keyed on a context has
+    to be invalidated by nothing (contexts are immutable) but held weakly, and
+    that is machinery to add when a measurement asks for it rather than in
+    advance.

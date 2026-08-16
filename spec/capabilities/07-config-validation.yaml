@@ -1,0 +1,491 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: config-validation
+title: Config validation — a plugin never starts half-configured
+status: implemented
+tier: 1
+summary: >-
+  Plugin configuration is validated and defaulted against a declared schema
+  before the plugin body runs; invalid config fails that fiber with per-field
+  issue paths and leaves the rest of the tree untouched.
+
+problem:
+  statement: >-
+    Configuration arrives from files written by humans and from patches applied
+    by other layers. A plugin that reads raw config discovers problems in the
+    middle of doing work, at which point it has already acquired resources and
+    the error message is about a NoneType rather than about a field.
+  without_this:
+    - Errors surface as attribute errors deep inside a plugin, with no
+      indication of which file or which field caused them.
+    - Every plugin writes its own defaulting logic, so the effective default
+      for a field differs between the code and the documentation.
+    - A partially valid config leaves a plugin running in an undefined state
+      rather than failing cleanly.
+  rejected_alternatives:
+    - option: Hardcode a single validation library in the core.
+      why_rejected: >-
+        Forces a heavy dependency on every consumer and makes the core
+        unusable for anyone standardised on a different library. The core
+        depends on a protocol; adapters are separate.
+    - option: Validate lazily on first field access.
+      why_rejected: >-
+        Defeats the purpose: the plugin has already started and registered by
+        the time the bad field is touched.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/core/src/fiber.ts
+      symbol: "resolveConfig, ValidationError"
+      note: >-
+        Upstream accepts any Standard Schema validator via the `~standard`
+        property and explicitly rejects async validation.
+    - repo: kb-docs
+      path: modular-software/cordis-cheatsheet.md
+      symbol: "§2.8 Config"
+
+depends_on: [fiber-lifecycle]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      Config is validated before the plugin body runs. A validation failure
+      transitions the fiber to FAILED and the body never executes.
+    rationale: The whole point; a body that runs on bad config is the failure mode.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      Validation produces the *resolved* config — defaults applied, types
+      coerced per the schema — and the body receives that, never the raw input.
+    rationale: >-
+      If the body sees raw input it must re-apply defaults, and the two
+      defaulting sites drift.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      A validation failure reports every issue, each with a path into the
+      config structure, not only the first.
+    rationale: >-
+      Fixing configuration one error per restart is the difference between a
+      one-minute and a twenty-minute edit loop.
+
+  - id: SEM-004
+    kind: MUST-NOT
+    rule: >-
+      Validation MUST NOT be asynchronous. A schema whose validation requires
+      awaiting raises `AsyncValidationError` at declaration time.
+    rationale: >-
+      Async validation would mean the config is unknown during the window in
+      which dependencies are being evaluated, making fiber state depend on IO
+      timing. Checks that need IO belong in the plugin body, where failure is
+      a normal fiber failure.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      A plugin declaring no schema receives its config unchanged, including
+      None.
+    rationale: >-
+      The trivial plugin must stay trivial; requiring a schema to opt out is a
+      tax on the common case.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      Validation is a pure function of the raw config and the schema: repeated
+      validation of the same input yields an equal result and performs no side
+      effects.
+    rationale: >-
+      The runtime validates the same config repeatedly — on reload, on config
+      re-read, on dependency-driven restart. Impurity here makes those
+      operations non-idempotent.
+
+  - id: SEM-007
+    kind: MUST
+    rule: >-
+      The core depends only on a validator protocol (`validate(raw) -> Ok |
+      Issues`); adapters for concrete libraries live in separate modules and
+      are optional dependencies.
+    rationale: >-
+      Keeps the core installable with no third-party dependencies, which
+      matters for a framework that other packages will pin.
+
+python_design:
+  module: cordis.config
+  surface:
+    - "CONFIG_SCHEMA_ATTR: str = \"Config\"            # what a plugin declares with"
+    - "DECLARED_SCHEMA_ATTR: str = \"__cordis_config__\"  # what the decorator writes"
+    - "@dataclass(frozen=True)\nclass ConfigIssue:"
+    - "    path: tuple[str | int, ...]\n    message: str"
+    - "    def __str__(self) -> str: ...   # \"plugins[2].timeout_ms: must be an int\""
+    - "@dataclass(frozen=True)\nclass ConfigResult(Generic[T]):"
+    - "    value: T | None\n    issues: tuple[ConfigIssue, ...]"
+    - "    @property\n    def ok(self) -> bool: ..."
+    - "    @classmethod\n    def accepted(cls, value: T) -> ConfigResult[T]: ..."
+    - "    @classmethod\n    def rejected(cls, *issues: ConfigIssue) -> ConfigResult[T]: ..."
+    - "class ConfigSchema(Protocol[T]):"
+    - "    def validate(self, raw: object, /) -> ConfigResult[T]: ..."
+    - "def render_path(path: Sequence[str | int]) -> str: ...   # plugins[2].timeout_ms"
+    - "def config_schema(schema: ConfigSchema[Any] | type) -> Callable[[F], F]: ..."
+    - "def schema_of(target: object) -> ConfigSchema[Any] | None: ..."
+    - "def resolve_config(schema: ConfigSchema[T] | None, raw: object, /, *, plugin: str) -> T | object: ..."
+    - "# the stdlib adapter, no third-party dependency:"
+    - "def from_dataclass(cls: type[T]) -> ConfigSchema[T]: ..."
+    - "# the mount seam, in cordis.plugin:"
+    - "class PluginHandle(Fiber):"
+    - "    @property\n    def raw_config(self) -> object: ...   # as submitted"
+    - "    async def update(self, config: object, /) -> None: ...  # resolves, then compares"
+    - "class IssueLike(Protocol):   # what an error needs of an issue: a path and a message"
+    - "class ConfigValidationError(CordisError, ValueError): plugin, issues"
+    - "class AsyncValidationError(CordisError, TypeError): plugin"
+  idioms:
+    - >-
+      A plugin declares `Config` as both the annotation and the schema, exactly
+      as upstream does: a dataclass used as the type annotation on
+      `apply(ctx, config: Config)` and found by the mount through the
+      module-level or class-level `Config` attribute. One name, both roles.
+      `@config_schema(...)` is the decorator spelling for a function, and the
+      reader is one function, mirroring `dependencies_of` in capability 05.
+    - >-
+      A bare dataclass in `Config` is adapted on sight: `schema_of` wraps
+      anything that is a dataclass type rather than requiring the author to
+      call `from_dataclass` themselves. Anything else must already satisfy the
+      protocol, which is a structural check and needs no registration.
+    - >-
+      `ConfigIssue.path` is a tuple of keys and indices so it renders as
+      `plugins[2].timeout_ms` without string parsing, and so a test can walk it
+      back into the submitted structure.
+    - >-
+      Resolution happens at the mount call and at `update`, not inside the
+      body: `ctx.config` and the value the body receives are the same resolved
+      object, and children see it too. A mount whose config does not validate
+      still returns a handle -- the failure belongs to the fiber, not to the
+      caller (plugin-mounting SEM-001), so the error is held and raised from
+      the load, where FAILED is a state the system already knows how to reach.
+    - >-
+      `update` compares *resolved* configs. Two raw inputs that resolve to the
+      same value -- a re-read file with reordered keys, an omitted field that
+      defaults to what was written -- are one config, and the fiber does not
+      restart. This falls out of resolving before the comparison in
+      fiber-lifecycle SEM-008 rather than being a rule of its own.
+    - >-
+      The adapter reports an unknown key rather than dropping it. A misspelled
+      key is the most common configuration mistake there is, and silently
+      ignoring one means the operator's edit had no effect and nothing said so
+      -- the exact failure this capability exists to prevent, arriving through
+      the door marked "lenient".
+    - >-
+      A value that is already an instance of the schema's own type is accepted
+      unchanged. Config does not always come from a file: a test, or a parent
+      plugin composing a child, has the typed object in hand, and making it
+      turn that back into a mapping first would be a chore with no purpose.
+  typing_notes:
+    - >-
+      `ConfigSchema` is `Protocol[T]`, invariant. Covariance is what the value's
+      direction of travel suggests, but the value leaves inside a
+      `ConfigResult[T]`, and that class takes `T` in the parameter of its
+      `accepted` classmethod, where a covariant variable is not allowed. See
+      the deviation.
+    - >-
+      `from_dataclass` narrows its argument through a deliberately `Any`-typed
+      alias rather than narrowing the parameter itself.
+      `dataclasses.is_dataclass` narrows `type[T]` to an intersection with
+      `DataclassInstance`, after which mypy refuses the structural match
+      against `ConfigSchema[T]` at the return statement -- an error about a
+      protocol that has nothing to do with dataclasses.
+    - >-
+      `resolve_config` returns `T` and raises rather than returning a union,
+      because every caller inside the runtime treats an invalid config as a
+      failure. `ConfigResult` is the protocol's currency; the exception is the
+      runtime's.
+    - >-
+      The stdlib adapter reads annotations with `typing.get_type_hints`, which
+      resolves string annotations from `from __future__ import annotations` --
+      the form every module in this project uses, so an adapter that read
+      `__annotations__` directly would see strings and validate nothing.
+  concurrency:
+    - >-
+      SEM-004 makes validation synchronous, so it happens inside the same
+      synchronous stretch as the mount, before any fiber state is announced.
+      An async validator is rejected where it is declared, not where it runs:
+      by the time it ran, the caller who could fix it is gone.
+    - >-
+      `PluginHandle.update` resolves and records the held error before taking
+      the fiber's gate, so two concurrent updates of the same instance can
+      interleave their record-keeping. This is the same check-then-act window
+      `Fiber.update` already has around its equality test, and closing it for
+      config alone would mean duplicating the gate's body rather than sharing
+      it. Two callers updating one instance concurrently are racing about which
+      config wins regardless.
+  deviations:
+    - >-
+      Only the stdlib dataclass adapter is implemented. The pydantic and
+      jsonschema adapters named in the original surface are deferred: both
+      libraries already expose a validate-shaped method, so the adapter is a
+      three-line shim that cannot be *tested* without adding the dependency it
+      exists to avoid. The protocol is what this capability owes; a shim per
+      library belongs with whatever package takes that dependency.
+    - >-
+      The stdlib adapter checks types and applies defaults; it does not coerce.
+      `"30"` is not an `int`. A coercion table is a validation library, and
+      SEM-007 exists precisely so the core does not grow one. Types it does not
+      understand are rejected at declaration time, so an author learns their
+      schema is unsupported when they write it rather than when a config
+      arrives.
+    - >-
+      The fiber keeps the raw config alongside the resolved one. A restart
+      reuses the resolved value rather than re-resolving: resolution is
+      idempotent for a well-behaved schema (SEM-006), but only for a
+      well-behaved one, and re-resolving an already-defaulted value is a second
+      chance to get it wrong for no benefit. The raw value stays because it is
+      what an operator wrote, and a diagnostic that echoed the resolved value
+      would show fields nobody typed.
+    - >-
+      `ConfigSchema` is invariant where the design said covariant. A covariant
+      variable cannot appear in a parameter position, and `ConfigResult.accepted`
+      is a classmethod taking one -- the exemption that lets `__init__` do this
+      does not extend to classmethods. What covariance would have bought is a
+      `ConfigSchema[Timeouts]` passed where a `ConfigSchema[object]` is wanted,
+      and nothing does that: the runtime holds `ConfigSchema[Any]` and hands the
+      value to a body that annotated it itself.
+    - >-
+      SEM-004 says an async validator is refused *at declaration time*, and half
+      of it is: a `validate` that is a coroutine function is caught by
+      `schema_of`, before a handle exists. A `validate` that merely returns an
+      awaitable cannot be recognised without calling it, so that half is caught
+      on the first resolution -- which for a declared schema is still inside the
+      mount call, so both raise from the same place and no fiber is ever created
+      holding one. The distinction is invisible to PROP-CONFIG-006 by
+      construction: its three shapes all raise from `host.root.plugin(...)`.
+    - >-
+      PROP-CONFIG-003's generator omits a random subset of defaulted fields.
+      The card's domain said "schemas and configs, both valid and invalid",
+      which a straightforward generator satisfies by producing configs that name
+      every field -- and an adapter that defaults by writing into the mapping it
+      was handed mutates nothing when there is nothing to fill in. The mutant
+      for this card survived until the omission was added, which is the whole
+      argument for running them.
+
+properties:
+
+  - id: PROP-CONFIG-001
+    claim: >-
+      For any config that fails validation, the plugin body is never invoked
+      and the fiber ends in FAILED.
+    shape: safety
+    evidence: [SEM-001]
+    domain:
+      generates: >-
+        A schema plus config values generated to violate it — wrong types,
+        missing required fields, out-of-range values, extra fields where
+        forbidden.
+      strategy_hint: >-
+        Generate the schema first, then derive invalid values from it by
+        mutation, rather than generating arbitrary values and filtering for
+        invalidity, which would discard most of them.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        A spy on the plugin body records invocations; assert count 0 and
+        `fiber.state is FAILED`.
+      independence: >-
+        Observes invocation, a fact the validation path cannot influence
+        retroactively.
+    failure_value: >-
+      Validating after constructing the child context and calling the body's
+      import-time side effects, so a mistyped field still runs half a plugin.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_config_validation.py::test_an_invalid_config_never_reaches_the_body
+
+  - id: PROP-CONFIG-002
+    claim: >-
+      For any config that passes validation, the value the body receives equals
+      the schema's resolved output, with all defaults applied.
+    shape: differential
+    evidence: [SEM-002]
+    domain:
+      generates: A schema with generated defaults, plus valid partial configs omitting a generated subset of defaulted fields.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The expected value is computed by calling the schema's `validate`
+        directly in the test and comparing to what the body observed.
+      independence: >-
+        The schema is a third-party or stdlib construct not written for this
+        framework; the property constrains the framework to pass through
+        exactly what the schema produced, adding nothing and dropping nothing.
+    failure_value: >-
+      Passing the raw dict to the body while validating a copy, so declared
+      defaults are silently absent and every plugin author reintroduces
+      `config.get("timeout", 30)` — with a different number than the schema's.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_config_validation.py::test_the_body_receives_exactly_what_the_schema_resolved
+
+  - id: PROP-CONFIG-003
+    claim: >-
+      Validating the same config twice produces equal results and leaves no
+      observable side effect.
+    shape: idempotency
+    evidence: [SEM-006]
+    domain:
+      generates: Schemas and configs, both valid and invalid.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Equality of the two resolved values (or of the two issue lists), plus
+        equality of the input object before and after, verified by deep
+        comparison against a pre-taken copy.
+      independence: >-
+        The pre-taken deep copy is made by `copy.deepcopy` before any
+        validation runs.
+    failure_value: >-
+      A schema adapter that applies defaults by mutating the input dict in
+      place, so re-reading an unchanged config file produces a config that
+      differs from the previous read and restarts every plugin.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_config_validation.py::test_validating_twice_answers_the_same_and_changes_nothing
+
+  - id: PROP-CONFIG-004
+    claim: >-
+      Every reported issue carries a path that resolves to a real location in
+      the submitted config structure, and every violated field appears in the
+      issue list.
+    shape: conservation
+    evidence: [SEM-003]
+    domain:
+      generates: >-
+        Nested schemas (depth 1-4, with lists and mappings) and configs
+        containing a generated set of 1-6 deliberate violations at known paths.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The set of paths the generator deliberately corrupted must be a subset
+        of the reported issue paths, and every reported path must be walkable
+        in the submitted structure.
+      independence: >-
+        The corrupted-path set is decided by the generator before validation;
+        path walkability is checked by a small test-local traversal.
+    failure_value: >-
+      Reporting only the first issue, or reporting paths relative to a
+      normalised internal structure so `plugins[2].timeout` is reported as
+      `timeout` and the operator cannot tell which of forty rows is wrong.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_config_validation.py::test_every_violation_is_reported_at_a_path_that_exists
+
+  - id: PROP-CONFIG-005
+    claim: >-
+      A plugin with no declared schema receives exactly the object it was
+      mounted with, by identity.
+    shape: safety
+    evidence: [SEM-005]
+    domain:
+      generates: Arbitrary config values including None, scalars, nested containers, and non-serialisable objects.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: "`observed is submitted` for every mount."
+      independence: >-
+        Identity comparison against an object the test constructed; no
+        transformation can satisfy it.
+    failure_value: >-
+      Round-tripping unschema'd config through a JSON normaliser "for
+      consistency", which breaks any plugin configured with a live object such
+      as a client handle or a callable.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_config_validation.py::test_a_plugin_without_a_schema_gets_exactly_what_it_was_given
+
+  - id: PROP-CONFIG-006
+    claim: >-
+      A schema whose validation is asynchronous is rejected where it is
+      declared, and no fiber is ever created holding one.
+    shape: safety
+    evidence: [SEM-004]
+    domain:
+      generates: >-
+        Async callables in every shape a validator can take -- a coroutine
+        function, an object whose `validate` is one, a callable returning an
+        awaitable -- paired with configs that would otherwise be valid.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        `AsyncValidationError` is raised by the mount call itself, the parent
+        gained no child, and the body never ran.
+      independence: >-
+        Counts invocations and children, both facts about what happened rather
+        than conclusions the validation path could restate.
+    failure_value: >-
+      Awaiting the validator, so a fiber's state depends on IO timing: the same
+      config makes a plugin ACTIVE or PENDING depending on how quickly a remote
+      schema service answered, and startup order stops being deterministic.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_config_validation.py::test_an_async_validator_is_refused_at_the_mount
+
+  - id: PROP-CONFIG-007
+    claim: >-
+      Any object with a conforming `validate` is a schema, and the kernel needs
+      no third-party module to say so.
+    shape: safety
+    evidence: [SEM-007]
+    domain:
+      generates: >-
+        Schema objects written three ways -- a plain class, an instance with a
+        bound method, a closure-backed object -- none of which inherit from or
+        register with anything in the framework.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Each is accepted and its resolved value reaches the body; separately,
+        importing every module under `cordis` pulls in no distribution outside
+        the standard library.
+      independence: >-
+        The import check reads `sys.modules` after a fresh import and compares
+        against the stdlib module list, which is not something the framework
+        can influence by restating it.
+    failure_value: >-
+      A core that imports pydantic to define its own config type, so every
+      application that depends on this framework inherits a pinned major
+      version of a library it may not use at all.
+    test_tier: local
+    status: passing
+    test_id: >-
+      tests/test_config_validation.py::test_anything_shaped_like_a_schema_is_a_schema
+
+open_questions:
+  - >-
+    RESOLVED (implementation): whether to ship a built-in schema for the
+    zero-dependency case. `from_dataclass` ships. The boundary that keeps it
+    from becoming a second validation library is written down rather than
+    hoped for: it checks types and applies defaults, it does not coerce, and
+    an annotation it cannot check is refused when the schema is adapted rather
+    than waved through. A request for constraints — ranges, patterns, "one of"
+    — is a request for a validation library, and the answer is a schema object,
+    which the protocol already accepts.
+  - >-
+    Whether a plugin should be able to see the issues that failed it without
+    catching the exception. `ConfigValidationError` carries them and the fiber
+    holds it as `fiber.error`, which covers a caller that awaits the handle; a
+    diagnostics reader (capability 15) may want them as data rather than as an
+    exception. Deferred until that capability has a shape.

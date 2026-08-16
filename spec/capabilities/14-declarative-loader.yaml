@@ -1,0 +1,561 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: declarative-loader
+title: Declarative loader — the application is a config file
+status: implemented
+tier: 3
+summary: >-
+  A plugin that reads a list of entries from a config file, mounts each as a
+  plugin, and reconciles the live tree against the file whenever it changes —
+  diffing by stable entry id so unchanged rows are never remounted.
+
+problem:
+  statement: >-
+    If composition lives in Python code, changing which features are loaded
+    means editing and redeploying code, and the set of loaded features is
+    invisible to anyone who cannot read the whole import graph. Moving the
+    composition into data makes the application's shape inspectable,
+    diffable, patchable, and changeable at runtime.
+  without_this:
+    - Feature selection is a code change, so operators cannot compose a
+      deployment without a Python developer.
+    - There is no single artefact answering "what is running", so the answer is
+      assembled by reading imports.
+    - Reconfiguration requires a restart, discarding all in-memory state.
+  rejected_alternatives:
+    - option: A Python composition module (`app.py` calling ctx.plugin).
+      why_rejected: >-
+        Remains fully supported and is the right choice for embedding. The
+        loader adds the data-driven path; it does not replace the code path.
+    - option: Entry points / plugin auto-discovery as the primary mechanism.
+      why_rejected: >-
+        Implicit, order-dependent on installed distributions, and unable to
+        express two configured instances of the same plugin.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/loader/src/config/entry.ts
+      symbol: "Entry, EntryOptions, Entry.update"
+    - repo: cordis
+      path: packages/include/src/index.ts
+      symbol: "Include, applyPatches"
+    - repo: cordis
+      path: packages/core/bin.js
+      note: "The whole launcher is twelve lines: root context, mount loader, point it at a file."
+    - repo: kb-docs
+      path: modular-software/cordis-in-22-steps.md
+      symbol: "Steps 14-15"
+
+depends_on:
+  [plugin-mounting, config-validation, fiber-lifecycle, logging, capability-seam]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      An entry is a mapping with fields `id`, `name`, and optionally `config`,
+      `disabled`, `group`, `inject`, `isolate`, `intercept`. `name` is a
+      resolvable target specifier; `id` is a stable identifier within its
+      containing list.
+    rationale: >-
+      A closed, validated entry vocabulary is what allows a config file to be
+      checked before anything is imported.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      Reconciliation diffs the new entry list against the live one by `id`:
+      entries present in both and unchanged are left untouched; changed
+      entries are updated; added entries are mounted; removed entries are
+      disposed.
+    rationale: >-
+      This is what makes editing one row of a forty-row file cost one remount
+      rather than forty.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      An entry without an explicit `id` is rejected with a validation error
+      naming its position.
+    rationale: >-
+      Upstream generates an id when absent, which makes the entry differ on
+      every read and remount on every save. Requiring the id converts a silent
+      performance and correctness trap into an authoring error.
+    deviation:
+      upstream: "Upstream auto-generates a missing id and writes it back to the file."
+      rationale: >-
+        Write-back mutates the user's file, which is surprising and hostile to
+        version control and to read-only deployments. Requiring the id costs
+        one line per entry and removes the trap entirely.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      Entries are mounted concurrently; the order of entries in the file
+      carries no load-ordering semantics and MUST NOT affect the final tree.
+    rationale: >-
+      Order-independence is guaranteed by injection; letting file order matter
+      would silently reintroduce startup-ordering bugs into configuration.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      `disabled: true` prevents mounting but preserves the entry, so toggling
+      it back mounts the same entry with the same id.
+    rationale: >-
+      Deleting and re-adding is not equivalent: the id is how patches and
+      diagnostics refer to the row.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      An entry whose target cannot be resolved or whose config fails validation
+      fails that entry only; every other entry mounts normally and the failure
+      is reported with the entry id and file location.
+    rationale: >-
+      One bad row must not prevent an operator from reaching a running system
+      to fix it.
+
+  - id: SEM-007
+    kind: MUST
+    rule: >-
+      A `group` entry contains a nested entry list as its config and mounts its
+      children under its own context; disposing the group disposes the
+      children, and group nesting composes with isolation and interception.
+    rationale: >-
+      Groups are how a subtree gets a shared isolation or interception setting
+      without repeating it per row.
+
+  - id: SEM-008
+    kind: MUST
+    rule: >-
+      Reconciliation is atomic with respect to observers: `runtime.inspect()`
+      never reports a tree that mixes entries from two different file versions.
+    rationale: >-
+      A diagnostic run during a reload must not produce a snapshot that never
+      actually existed.
+
+python_design:
+  module: cordis.loader
+  surface:
+    - "GROUP: Final = 'group'  # the reserved target name of a group entry"
+    - "@dataclass(frozen=True, slots=True)\nclass Entry:\n    id: str\n    name: str\n    config: object = None\n    disabled: bool = False\n    inject: tuple[str, ...] | None = None\n    isolate: Isolation = ()\n    intercept: Interception | None = None\n    group: tuple[Entry, ...] | None = None  # set iff name == GROUP"
+    - "@dataclass(frozen=True, slots=True)\nclass EntryFailure:\n    id: str    # the dotted path, not a bare id\n    reason: str\n    error: BaseException"
+    - "@dataclass(frozen=True, slots=True)\nclass ReconcileReport:\n    mounted / updated / disposed / unchanged: tuple[str, ...]\n    failed: tuple[EntryFailure, ...]\n    @property\n    def quiet(self) -> bool"
+    - "def read_entries(raw: object, /) -> tuple[Entry, ...]  # the envelope, validated in full"
+    - "def as_mapping(entry: Entry, /) -> dict[str, object]   # the inverse, defaults omitted"
+    - "class TargetSource(Definition):\n    name = 'loader.targets'\n    def resolve(self, name: str, /) -> PluginTarget: ..."
+    - "class ImportTargets(TargetSource): ...  # `pkg.mod:attr`, `pkg.mod`, `./path.py`"
+    - "class LoaderService(Service):\n    name = 'loader'"
+    - "    async def reconcile(self, entries: Sequence[Entry], /, *, dry_run: bool = False) -> ReconcileReport"
+    - "    async def remount(self, paths: Sequence[str], /, *, between: Callable[[], object] | None = None) -> ReconcileReport"
+    - "    def live(self) -> tuple[str, ...]  # every mounted id, dotted, in mount order"
+    - "    def handle_for(self, path: str, /) -> PluginHandle | None"
+    - "class FileSource(Protocol):\n    def read(self) -> tuple[Entry, ...]: ..."
+    - "class MappingSource / JsonSource / TomlSource / YamlSource"
+  idioms:
+    - >-
+      Target resolution is a capability seam rather than a method: `TargetSource`
+      is a `Definition` (capability 19) and `ImportTargets` is its default
+      Provider. Binding another one is how a test supplies synthetic targets and
+      how a locked-down deployment refuses to import anything not on an
+      allow-list -- neither of which is reachable if resolution is a method on
+      the loader.
+    - >-
+      `ImportTargets` accepts `pkg.module:attr`, a bare importable module with a
+      module-level `apply`, and a filesystem path -- `importlib` rather than a
+      custom resolver. A module object is already a valid `PluginTarget`, since
+      mounting looks for `apply` structurally, so the bare-module form needs no
+      unwrapping.
+    - >-
+      `read_entries` validates the whole list before returning any of it and
+      reports every issue at once as `ConfigValidationError`, in the same
+      currency as every other config failure. That is what makes SEM-003's
+      "naming its position" free: the issue path is the position.
+    - >-
+      A group is mounted as an ordinary plugin with an empty body, and its
+      children are mounted on `handle.plugin`. Disposal, isolation and
+      interception then compose exactly as they do for any other subtree
+      (SEM-007) rather than being reimplemented for groups.
+    - >-
+      `ReconcileReport` lists mounted, updated, disposed, unchanged and failed
+      entries, and `dry_run=True` runs the same code path with the apply step
+      skipped, so `--dry-run` and `--dump-config` cannot diverge from a real
+      reconcile.
+    - >-
+      The file source is a Protocol whose implementations each import their own
+      parser inside `read`, so the loader never imports a parser and the YAML
+      one costs nothing on an installation without PyYAML.
+    - >-
+      The diff has exactly two verdicts, and `_shape(entry)` is the whole rule
+      for which one applies: target, `inject`, `isolate` and `intercept` are
+      decided when an instance is built, so changing any of them is a remount,
+      and everything else -- which is to say `config` -- is what
+      `PluginHandle.update` exists for. Writing the rule as one function is why
+      an author cannot get "which edits are cheap" subtly different from
+      "which edits are safe".
+    - >-
+      A group is compared by its own settings and never by its config, because
+      a group's config *is* its children and they are diffed one by one. The
+      alternative -- comparing the serialised child list -- makes editing any
+      row inside a group restart the whole group, which is the forty-row
+      remount this capability exists to avoid, moved one level down.
+  typing_notes:
+    - >-
+      `Entry.config` is `object`; it is validated per-plugin by the config
+      capability, not by the loader, which only validates the entry envelope.
+    - >-
+      `Entry.isolate` and `Entry.intercept` reuse the `Isolation` and
+      `Interception` aliases the mount API already takes, so an entry field is
+      the mount keyword and no third spelling of either exists.
+  concurrency:
+    - >-
+      Reconciliation computes the whole diff synchronously, awaits the
+      disposals and updates, then applies every mount in one synchronous
+      section. Mounting is itself synchronous -- it arms a fiber -- so SEM-004's
+      concurrency is the fibers', not a TaskGroup's, and file order cannot
+      become load order.
+    - >-
+      `reconcile` holds an `asyncio.Lock` for its duration, so two reconciles
+      cannot interleave their diffs.
+  deviations:
+    - >-
+      Amended by config-expressions: `Entry.disabled` is `bool | Expr`, an
+      entry's `config` may contain `Expr` values at any depth, and both are
+      read out of the document by `read_entries`, which also rejects an
+      expression in any other field. The planner decides `disabled` against the
+      loader's own context; a `config` expression rides to the mount as a
+      preparer the kernel calls while building the instance's context. The
+      plan-time config pre-check is skipped for an entry whose config holds
+      expressions, since there is nothing yet to validate — that entry fails at
+      load instead, through the path a failing body already uses.
+    - >-
+      SEM-008 is honoured as "no two reconciles interleave, and every mount of
+      one reconcile lands in a single synchronous section" rather than as full
+      atomicity. Disposal and update are `await`s by nature; an observer that
+      inspects the tree *during* one necessarily sees a tree in transition, and
+      an implementation claiming otherwise would be claiming to make an
+      awaiting operation invisible. What the port guarantees instead is that
+      the transition is monotone -- removals first, then additions -- and that
+      `quiesce()` is the supported way to ask for a settled tree.
+    - >-
+      Failures are reported with the entry's dotted id path, not a file
+      location. The loader is handed parsed entries and never sees a file;
+      line numbers belong to the `FileSource` that read one. The dotted path
+      (`group.child`) is what actually identifies a nested entry, which a bare
+      id does not.
+    - >-
+      The sources live in `cordis.loader` beside the protocol rather than in a
+      `cordis.loader.sources.*` package. Each already defers its parser import
+      into `read`, which is the entire benefit a submodule per format would
+      have bought.
+    - >-
+      A group entry is one whose `name` is the reserved `GROUP`; its children
+      are its `config`, exactly as SEM-007 says. `Entry.group` is the parsed
+      form of that config, so the closed vocabulary keeps `name` required and
+      an author writes the nesting once.
+    - >-
+      Amended by hot-reload: `remount(paths, between=...)` rebuilds named
+      entries whose *code* changed, which no edit to the entry list can
+      express — the file says the same thing and means something different.
+      It reuses the same plan, the same disposal ordering and the same
+      reporting as a reconcile, and `between` is where the reimport happens:
+      after every affected instance is gone and before any is rebuilt, which
+      is the ordering hot-reload SEM-002 demands and which only the owner of
+      the tree can enforce. Targets are resolved again after `between` runs, so
+      what gets mounted is the code just loaded rather than the code the plan
+      was made against, and a target `between` broke fails that entry alone.
+      Covered by `tests/test_loader.py::test_remounting_rebuilds_only_the_named_entries`,
+      `::test_a_remount_reimports_between_the_old_and_the_new`,
+      `::test_a_remount_that_cannot_resolve_fails_that_entry_alone`,
+      `::test_remounting_a_group_rebuilds_its_children` and
+      `::test_remounting_nothing_is_quiet`.
+    - >-
+      SEM-006's "whose config fails validation" is checked while the diff is
+      planned, not left for the mount to discover. The mount would find it
+      anyway -- an invalid config already fails its fiber (config-validation
+      SEM-001) -- but only after the instance exists, which means `dry_run`
+      could not report it and the report could not name the row. Resolving the
+      config twice for a valid entry is the price, and it is a pure function of
+      data both times.
+    - >-
+      A body that raises after mounting is reported too, as `start failed`,
+      which SEM-006 does not ask for. The instance is genuinely mounted and its
+      fiber is FAILED -- the loader does not pretend otherwise -- but "which
+      row of the file is broken" is a question only the loader can answer, and
+      an operator reading a reconcile report should not have to walk the fiber
+      tree to find out that one of the rows they just added never started.
+
+properties:
+
+  - id: PROP-LOADER-001
+    claim: >-
+      Reconciling to an entry list produces a live tree whose entry ids,
+      targets and configs equal that list, regardless of the previous tree.
+    shape: state-machine
+    evidence: [SEM-002, SEM-004]
+    domain:
+      generates: >-
+        A state machine issuing reconcile operations with generated entry
+        lists over a fixed pool of synthetic targets, including additions,
+        removals, config edits, reorderings and enable/disable toggles.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The expected tree is the enabled subset of the last reconciled list,
+        computed by the test.
+      independence: >-
+        The model is the input list itself; convergence to it is exactly the
+        claim, and no intermediate state of the implementation enters the
+        computation.
+    failure_value: >-
+      A diff that matches entries positionally rather than by id, so inserting
+      one row at the top remounts every row below it.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_loader.py::test_the_tree_converges_to_the_last_list_reconciled
+
+  - id: PROP-LOADER-002
+    claim: >-
+      Reconciling to a list that differs from the current one only in the order
+      of entries performs no mounts, updates or disposals.
+    shape: idempotency
+    evidence: [SEM-002, SEM-004]
+    domain:
+      generates: An entry list plus a generated permutation of it.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        The ReconcileReport's mounted, updated and disposed lists are all
+        empty, and every fiber's identity is unchanged.
+      independence: >-
+        Fiber identity is compared with `is` against handles captured before
+        the reconcile.
+    failure_value: >-
+      Reordering a config file for readability restarting the entire
+      application, including dropping every session in progress.
+    test_tier: local
+    status: passing
+    test_id: tests/test_loader.py::test_reordering_a_file_changes_nothing
+
+  - id: PROP-LOADER-003
+    claim: >-
+      Editing one entry's config remounts exactly that entry and its
+      descendants, leaving every unrelated entry's fiber identity unchanged.
+    shape: conservation
+    evidence: [SEM-002]
+    domain:
+      generates: An entry list including groups, plus a generated single-entry config edit.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        Expected remount set is the edited entry plus its transitive children
+        in the generated tree; all other fibers must be identical objects.
+      independence: >-
+        The expected set is computed from the generated entry tree structure,
+        not from the loader's diff.
+    failure_value: >-
+      Comparing entries by serialising the whole list, so any edit invalidates
+      every entry and each config save restarts the process in place.
+    test_tier: local
+    status: passing
+    test_id: tests/test_loader.py::test_editing_one_config_touches_one_entry
+    notes: >-
+      The "and its descendants" half is `test_an_edited_entry_restarts_what_it_mounted`: an
+      entry that mounted children of its own restarts them, because `update` restarts
+      the body. The group half is
+      `test_editing_a_row_inside_a_group_leaves_the_group_alone`, which is what stops a
+      group being compared by its config -- the forty-row remount this capability
+      exists to avoid, moved one level down.
+
+  - id: PROP-LOADER-004
+    claim: >-
+      An entry whose target is unresolvable or whose config is invalid fails
+      alone; every other entry in the same list reaches its normal state.
+    shape: safety
+    evidence: [SEM-006]
+    domain:
+      generates: An entry list with a generated subset made invalid by a generated failure kind (bad target, bad config, raising body).
+    preconditions:
+      - At least one entry is invalid; guaranteed by construction.
+    oracle:
+      kind: invariant
+      description: >-
+        Valid entries are ACTIVE or PENDING per their dependencies; invalid
+        ones are FAILED and appear in the report's failed list with their ids.
+      independence: >-
+        The invalid set is the generator's choice, and states are read from the
+        diagnostics snapshot rather than the loader's own report alone.
+    failure_value: >-
+      A single unresolvable module name raising out of the TaskGroup and
+      cancelling every concurrent mount, so one typo yields an application that
+      loads nothing and reports one unrelated CancelledError.
+    test_tier: local
+    status: passing
+    test_id: tests/test_loader.py::test_a_bad_entry_fails_alone
+    notes: >-
+      The generated fault kinds are an unresolvable target, a config the target's schema
+      rejects, and a body that raises. The first two never reach a mount, because both
+      are checked while the diff is planned; the third mounts and then fails, and is
+      reported as `start failed` against its own entry. States are read from the
+      diagnostics snapshot, not from the report.
+
+  - id: PROP-LOADER-005
+    claim: >-
+      Reconciling twice with the same entry list is a no-op the second time.
+    shape: idempotency
+    evidence: [SEM-002]
+    domain:
+      generates: Entry lists including groups, disabled entries and nested structures.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        The second ReconcileReport is empty in all four categories and every
+        fiber identity is preserved.
+      independence: "Identity comparison against handles captured after the first reconcile."
+    failure_value: >-
+      Config values that do not survive a round trip through the entry
+      representation (a tuple read back as a list) comparing unequal, so a
+      file-watching loader remounts everything on every poll.
+    test_tier: local
+    status: passing
+    test_id: tests/test_loader.py::test_reconciling_twice_does_nothing_the_second_time
+
+  - id: PROP-LOADER-006
+    claim: >-
+      An entry list containing an entry without an id is rejected in full: no
+      entry from that list is mounted and the error names the offending
+      position.
+    shape: safety
+    evidence: [SEM-003]
+    domain:
+      generates: Entry lists with a generated subset of entries missing ids, at generated positions including inside groups.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Mount count is zero, the previous tree is untouched by identity, and
+        the reported positions equal the generated ones.
+      independence: "Positions are the generator's; the tree is compared to pre-captured handles."
+    failure_value: >-
+      Validating entries as they are mounted rather than up front, so a file
+      with a mistake halfway down leaves the application in a half-reconciled
+      state that matches no version of the file.
+    test_tier: local
+    status: passing
+    test_id: tests/test_loader.py::test_a_list_with_an_unnamed_entry_is_rejected_whole
+    notes: >-
+      Positions are compared as tuples, group-nested ones included: the issue path for a
+      row inside a group is `(index, "config", inner, "id")`, which is the position in
+      the file the operator has to go and fix.
+
+  - id: PROP-LOADER-007
+    claim: >-
+      Toggling an entry's disabled flag disposes or mounts exactly that entry
+      and its descendants, and toggling it back restores an entry with the same
+      id and config.
+    shape: roundtrip
+    evidence: [SEM-005]
+    domain:
+      generates: An entry list with generated disabled flags, plus a generated sequence of toggles including toggles of group entries.
+    preconditions: []
+    oracle:
+      kind: roundtrip
+      description: >-
+        After a disable followed by an enable, the resolved snapshot restricted
+        to that entry's subtree equals the snapshot taken before the disable,
+        excluding fiber identities.
+      independence: >-
+        The pre-snapshot is a frozen diagnostics value captured before the
+        toggle; the comparison cannot be satisfied by the loader recomputing
+        anything.
+    failure_value: >-
+      Treating `disabled: true` as removal in the diff, so re-enabling mounts a
+      fresh entry that patches targeting the original id no longer reach.
+    test_tier: local
+    status: passing
+    test_id: tests/test_loader.py::test_disabling_and_enabling_restores_the_same_entry
+
+  - id: PROP-LOADER-008
+    claim: >-
+      A group entry's children are mounted under the group's context, and
+      disposing the group disposes exactly its children and nothing else.
+    shape: conservation
+    evidence: [SEM-007, SEM-008]
+    domain:
+      generates: Nested group structures (depth 1-4) with generated isolation and interception settings on generated groups.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        Expected parent-child structure and expected per-child isolation and
+        interception chains are computed by the test from the generated entry
+        tree, then compared against the diagnostics snapshot.
+      independence: >-
+        Derived from the generator's entry tree; the loader's own nesting logic
+        is not consulted.
+    failure_value: >-
+      Group children mounted on the loader's context rather than the group's,
+      so a group-level isolation setting silently applies to nothing and two
+      groups meant to have separate shells share one.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_loader.py::test_a_group_owns_its_children_and_its_settings
+    notes: >-
+      Interception is the second axis and is covered by
+      `test_a_group_interception_reaches_its_children`. The case that makes the subtree
+      accounting load-bearing is
+      `test_a_group_that_must_be_rebuilt_names_the_children_it_takes`: a group whose own
+      settings changed cannot adopt them in place, so it is remounted, and the report
+      names every child that went with it.
+
+  - id: PROP-LOADER-009
+    claim: >-
+      An entry mapping is accepted if and only if it uses the closed vocabulary
+      with a string `id` and `name`, and every accepted mapping survives a round
+      trip through `Entry` unchanged.
+    shape: roundtrip
+    evidence: [SEM-001, SEM-003]
+    domain:
+      generates: >-
+        Entry mappings built from the vocabulary with generated subsets of the
+        optional fields present, plus a generated corruption -- an unknown key,
+        a missing or non-string `id` or `name`, or a non-mapping row -- applied
+        at a generated position including inside a group.
+    preconditions: []
+    oracle:
+      kind: roundtrip
+      description: >-
+        For an uncorrupted list, `as_mapping(read_entries(raw)[i])` equals row
+        `i` of `raw` with its defaults omitted; for a corrupted one, the raised
+        issue paths equal the generated corruption positions exactly.
+      independence: >-
+        The expected mapping is the generator's own row, and the expected issue
+        paths are the positions it chose to corrupt -- neither is read back from
+        the parser.
+    failure_value: >-
+      A parser that ignores keys it does not recognise, so `disabled: ture`
+      leaves the entry running and the config file and the running system
+      disagree with nothing to say so.
+    test_tier: local
+    status: passing
+    test_id: tests/test_loader.py::test_the_entry_vocabulary_is_closed_and_round_trips
+    notes: >-
+      Ids are unique within their own list, not globally --
+      `test_two_entries_may_not_share_an_id` covers both halves of that.
+
+open_questions:
+  - >-
+    RESOLVED (implementation): a group entry may change into a non-group entry
+    under the same id, and it is treated as a target change -- dispose, then
+    remount. The child ids do not vanish silently, which was the objection: the
+    report's `disposed` list carries the dotted path of every entry that went
+    away at any depth, so a group replaced by a plugin names each child it took
+    with it. That is a structural answer rather than a log line, which means it
+    holds whether or not a logger is bound.

@@ -1,0 +1,391 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: service-isolation
+title: Service isolation — realms give a subtree its own implementation
+status: implemented
+tier: 2
+summary: >-
+  `ctx.isolate(name, label=None)` returns a child context in which a service
+  name resolves in a fresh realm, so a subtree can be given its own provider
+  without affecting siblings; a shared label joins an existing realm instead of
+  minting one.
+
+problem:
+  statement: >-
+    One process often needs several instances of the same capability with
+    different configuration — two shells with different timeouts, a test double
+    alongside the real thing, one filesystem rooted in a sandbox and another
+    on the host — selected structurally rather than by every consumer passing
+    an identifier.
+  without_this:
+    - Multiple instances require distinct service names, so consumers must be
+      parameterised by name and the wiring leaks into every consumer.
+    - Test doubles must replace the global binding, so tests cannot run
+      concurrently and a leaked double corrupts unrelated tests.
+    - Multi-tenant or multi-workspace deployments need one process per tenant.
+  rejected_alternatives:
+    - option: Name mangling by convention (`shell:fast`, `shell:slow`).
+      why_rejected: >-
+        Pushes the discriminator into every consumer's declaration, which is
+        exactly the coupling the seam pattern removes.
+    - option: contextvars-scoped overrides.
+      why_rejected: >-
+        Scopes by call stack rather than by composition; a provider handed a
+        callback loses the isolation. Same reason contextvars was rejected for
+        the context tree itself.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/core/src/context.ts
+      symbol: "Context.isolate, Context.isolate symbol key"
+    - repo: cordis
+      path: packages/loader/src/config/isolate.ts
+      symbol: "LocalRealm, GlobalRealm"
+      note: >-
+        Upstream distinguishes a local realm (suffix `#entryId`, private to one
+        entry) from a global realm (suffix `@label`, shared by label), and
+        garbage-collects a realm when its last referencing entry drops it.
+    - repo: kb-docs
+      path: modular-software/cordis-in-22-steps.md
+      symbol: "Step 17"
+
+depends_on: [service-registry, context-tree]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      `ctx.isolate(name)` returns a child context in which `name` resolves in a
+      newly created realm; the parent and every context outside the child
+      continue to resolve `name` in their original realm.
+    rationale: Isolation must be one-directional or it is not isolation.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      `ctx.isolate(name, label)` resolves `name` in the realm identified by
+      `label`, creating it if absent; two contexts isolating the same name with
+      the same label share one realm and therefore one implementation.
+    rationale: >-
+      Sharing must be expressible, or two cooperating subtrees cannot be given
+      a common private instance.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      Isolation applies per service name. Names not isolated in a context
+      continue to resolve exactly as they did in the parent.
+    rationale: >-
+      Whole-subtree isolation would force each subtree to re-provide every
+      service it uses, which is the opposite of composition.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      Providing a service from within an isolated context binds it in that
+      context's realm for that name; it is invisible outside.
+    rationale: >-
+      Otherwise an isolated subtree's provider escapes and conflicts with the
+      outer binding.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      Dependency declarations resolve through the same realm mapping as direct
+      lookup, so a consumer inside an isolated subtree is held pending on, and
+      reloaded by, the isolated implementation — not the outer one.
+    rationale: >-
+      A mismatch here is the worst kind of bug: the consumer is activated by
+      the presence of one implementation and then calls a different one.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      A realm with no remaining referencing contexts and no bindings is
+      released; realm identity is never reused for a subsequently created
+      realm.
+    rationale: >-
+      Realms are created per isolating entry and per reload; without release
+      they accumulate. Non-reuse prevents a stale reference from resolving into
+      an unrelated new realm.
+
+python_design:
+  module: cordis.realm
+  surface:
+    - "# already in cordis.registry, unchanged:"
+    - "class Realm: label: str; parent: Realm | None"
+    - "DEFAULT_REALM: Final[Realm]"
+    - "REALM_KEY: Final = \"__realm__\"      # a context's realm for every name"
+    - "def realm_of(ctx: Context) -> Realm: ..."
+    - "def enter_realm(ctx: Context, realm: Realm) -> Context: ..."
+    - "# added to cordis.registry, because the reader lives with the key:"
+    - "def realm_key(name: str) -> str: ...   # \"__realm__:shell\""
+    - "def realm_for(ctx: Context, name: str) -> Realm: ...   # per name, then per context"
+    - "# cordis.realm:"
+    - "Isolation: TypeAlias = \"Iterable[str | type[Service]] | Mapping[str | type[Service], str | None]\""
+    - "def isolate(ctx: Context, names: Isolation, /) -> Context: ..."
+    - "def isolated_realm(name: str, label: str | None = None) -> Realm: ...  # interned when labelled"
+    - "def isolated_names(ctx: Context) -> frozenset[str]: ...   # for diagnostics"
+    - "# the mount seam, in cordis.plugin:"
+    - "def plugin(self, target, config=None, /, *, requires=None, isolate: Isolation = ()) -> PluginHandle: ..."
+    - "# and in cordis.registry, so a provider binds where its context resolves:"
+    - "def provide(self, name, value, *, scope, ctx: Context | None = None, realm: Realm | None = None, gate=None) -> EffectHandle: ..."
+  idioms:
+    - >-
+      A Realm is an opaque object with identity semantics, the Python analogue
+      of upstream's `Symbol`; labelled realms are interned in a module-level
+      `WeakValueDictionary` keyed by `(name, label)`, which gives SEM-006's
+      release for free and makes reuse impossible because identity is object
+      identity.
+    - >-
+      The per-name realm mapping lives in the same scoped-metadata chain as
+      everything else in `context-tree`: `isolate` is `extend` with one key per
+      isolated name (`__realm__:shell`), so there is no second scoping
+      mechanism and no mapping object to keep consistent. `realm_for` reads the
+      nearest such key, then falls back to the context's whole-context realm,
+      then to `DEFAULT_REALM` -- one lineage walk, three levels of specificity.
+    - >-
+      An isolated realm has no parent, and that is what makes isolation
+      isolate. Realms nest for `enter_realm`, whose purpose is an overlay that
+      falls through to what it does not override; isolation's purpose is the
+      opposite -- a subtree that does *not* see the outer implementation --
+      and a parented isolation realm would resolve the outer binding for every
+      name it had not yet been given.
+    - >-
+      Isolation is declared at the mount, `ctx.plugin(target, isolate=("shell",))`,
+      rather than by mounting into a separately forked context. A mounted
+      instance rebuilds its context on every reload, so an isolation held only
+      by the caller's context object would be lost the first time the instance
+      restarted; declaring it at the mount makes it a property of the instance,
+      which is what upstream's per-entry realm is.
+  typing_notes:
+    - >-
+      `isolate` accepts a Service subclass as well as a name and normalises to
+      the name, matching `inject` so the two never disagree about identity. The
+      mapping form carries labels; the sequence form is the unlabelled case
+      spelled without `{name: None}` noise.
+    - >-
+      The two spellings are told apart with `isinstance(names, Mapping)` rather
+      than by asking for an `items` attribute. A Mapping is also an Iterable, so
+      the union cannot be discriminated structurally without a `type: ignore` on
+      both branches, and an ignore on a branch is where a real error hides. The
+      normaliser that receives each token is typed `object` for the same reason:
+      the annotation states the contract, and the runtime check exists for the
+      caller who was never type-checked, so narrowing it to the declared type
+      would make its own guard unreachable.
+  concurrency:
+    - >-
+      Realm interning happens on the synchronous mount path, before any await,
+      so two contexts isolating the same label cannot interleave between the
+      lookup and the insert. The `WeakValueDictionary` is read and written
+      inside one function with no suspension point, which is the same
+      guarantee the registry's own critical sections rely on.
+  deviations:
+    - >-
+      `isolate` and `realm_for` are functions taking the context, not methods
+      on it -- `isolate(ctx, ...)` rather than `ctx.isolate(...)`. The surface
+      in this record transcribed upstream's TypeScript, where `Context` is the
+      one object; here `Context.__getattr__` resolves services, so every method
+      added to it is a service name an application can no longer use.
+      `scope_of`, `config_of` and `realm_of` already established the reader-as-
+      function idiom, and the mount seam (`plugin(isolate=...)`) is what
+      applications actually reach for.
+    - >-
+      Labelled realms are interned by `(name, label)`, not by label alone.
+      Upstream's global realm is a whole-context object; here the mapping is
+      per name, and two subtrees that both isolate `shell` under the label
+      `test` want one shared `shell` -- but a third subtree isolating `logger`
+      under the same label wants nothing to do with it. Keying by the pair
+      means a label means "the same *thing*", not "the same *place*".
+    - >-
+      `ServiceRegistry.provide` grows a `ctx=` keyword. Binding realm and
+      lookup realm must be derived by the same rule or SEM-004 fails silently,
+      and passing `realm=realm_for(ctx, name)` at every call site is that rule
+      written out four times. `realm=` stays for the tests that construct
+      realms directly.
+    - >-
+      PROP-ISO-001's oracle was rewritten from ancestry to realm identity. As
+      first drafted it read "visible iff the provider's node is an ancestor of
+      the observer", which describes a registry whose bindings live on the tree.
+      This port's bindings live in realms and are visible everywhere the realm
+      is, so two *sibling* subtrees isolating one name under one label see each
+      other's provider by design (SEM-002) and the drafted rule would have
+      called that a violation. The oracle now computes, per node, which realm
+      identity the name resolves in, and expects visibility exactly on equality
+      — still computed from the generated plan alone, and still failing on the
+      card's failure value, which sends the binding to the outer realm while
+      lookup goes to the isolated one.
+    - >-
+      PROP-ISO-001's model also predicts *rejections*. Because a realm holds one
+      binding per name, a plan that puts two providers of one name in one realm
+      must see the second refused; the test asserts the runtime's rejected set
+      equals the plan's prediction rather than tolerating conflicts, so an
+      isolation that quietly merged two realms would show up as an unpredicted
+      rejection instead of passing unnoticed.
+    - >-
+      PROP-ISO-005 stamps its labels with a per-example counter, and tolerates a
+      `ServiceConflictError` when two subtrees in one cycle share a label. Both
+      follow from interning being process-wide: a labelled realm retained
+      anywhere in a *previous* Hypothesis example would read as this example's
+      leak, and two subtrees sharing a label share the one binding slot. Neither
+      weakens the card — the retention question is asked about realms this
+      example created, and the conflict is SEM-002 working.
+
+properties:
+
+  - id: PROP-ISO-001
+    claim: >-
+      A service provided inside an isolated context is not resolvable from any
+      context outside that subtree.
+    shape: safety
+    evidence: [SEM-001, SEM-004]
+    domain:
+      generates: >-
+        A context tree with a generated set of isolation points and providers
+        placed at generated nodes, plus a generated set of (observer, name)
+        resolution queries.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The expected visibility is computed by the test from the generated tree
+        using a plain rule: for each node the test computes the realm identity
+        that node resolves the name in — the nearest enclosing isolation of that
+        name, named by its label when it has one and by the isolating node when
+        it does not, and the outer realm when there is none — and a provider is
+        visible to an observer iff the two identities are equal. Two providers
+        landing on one identity is a conflict, and the plan predicts which
+        provide the runtime must reject.
+      independence: >-
+        The rule is implemented over the generator's own tree description; it
+        computes identities as plain tuples of generated labels and node
+        indices and never consults a `Realm`.
+    failure_value: >-
+      Isolating by shadowing the binding at lookup time rather than by keying
+      the binding, so a provider inside an isolated group is also registered
+      under the outer realm and a sibling group silently picks it up.
+    test_tier: local
+    status: passing
+    test_id: tests/test_service_isolation.py::test_a_provider_is_seen_by_exactly_the_realm_it_bound_in
+
+  - id: PROP-ISO-002
+    claim: >-
+      Two contexts isolating the same name with the same label resolve to the
+      identical implementation object; with different labels or no label, they
+      never do.
+    shape: differential
+    evidence: [SEM-002]
+    domain:
+      generates: >-
+        Pairs of isolation points with generated labels drawn from a small
+        alphabet plus None, so collisions and non-collisions both occur often.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Identity comparison of the resolved objects, expected equal exactly
+        when both labels are the same non-None value.
+      independence: >-
+        The expected relation is the generator's label choice; the observation
+        is object identity.
+    failure_value: >-
+      Treating `label=None` as a label, so every unlabelled isolation joins one
+      shared "None" realm and isolation silently stops isolating.
+    test_tier: local
+    status: passing
+    test_id: tests/test_service_isolation.py::test_a_label_is_what_makes_two_isolations_one
+
+  - id: PROP-ISO-003
+    claim: >-
+      Isolating one name leaves resolution of every other name identical to the
+      non-isolated case.
+    shape: metamorphic
+    evidence: [SEM-003]
+    domain:
+      generates: A provider set over several names, plus a generated subset of names to isolate at a generated node.
+    preconditions: []
+    oracle:
+      kind: metamorphic
+      description: >-
+        For every non-isolated name, compare the resolved object identity in
+        the isolated child against the same lookup in the parent.
+      independence: >-
+        Compares two lookups whose only difference is the isolation, so any
+        over-broad isolation shows up as an identity mismatch.
+    failure_value: >-
+      Implementing isolation by giving the child a fresh registry rather than a
+      fresh realm for one name, so an isolated subtree loses access to the
+      logger and every unrelated service.
+    test_tier: local
+    status: passing
+    test_id: tests/test_service_isolation.py::test_isolating_one_name_moves_only_that_name
+
+  - id: PROP-ISO-004
+    claim: >-
+      A consumer inside an isolated subtree is activated by, and reloaded on
+      changes to, the isolated implementation and never the outer one.
+    shape: state-machine
+    evidence: [SEM-005]
+    domain:
+      generates: >-
+        A state machine that provides and removes implementations of one name
+        both inside and outside an isolated subtree, in generated order.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The test tracks which realm each provide targeted; the consumer's
+        expected active state depends only on the inner realm's occupancy, and
+        each load must observe the inner object by identity.
+      independence: >-
+        Realm targeting is the test's own construction record.
+    failure_value: >-
+      Dependency evaluation using the un-isolated name while lookup uses the
+      isolated one, so the consumer activates because an outer shell exists and
+      then calls the inner shell that has not been provided yet.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_service_isolation.py::TestIsolationMachine::runTest
+
+  - id: PROP-ISO-005
+    claim: >-
+      Repeatedly creating and dropping isolated subtrees leaves no growth in
+      the number of live realms.
+    shape: conservation
+    evidence: [SEM-006]
+    domain:
+      generates: A generated number of create-and-dispose cycles over isolated subtrees, with a mix of labelled and unlabelled isolation.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Live realm count after a forced garbage collection returns to its
+        pre-cycle value.
+      independence: >-
+        Counts live objects via weak references, which reflect actual
+        reachability rather than the runtime's own bookkeeping.
+    failure_value: >-
+      Interning labelled realms in a strong-keyed dict, so every reload of a
+      config file that isolates by label leaks one realm and its bindings —
+      unbounded growth on a long-running process with hot reload enabled.
+    test_tier: nightly
+    status: passing
+    test_id: tests/test_service_isolation.py::test_isolated_subtrees_leave_no_realms_behind
+
+open_questions:
+  - >-
+    RESOLVED (implementation): whether isolating a name that no ancestor
+    provides should be an error. It stays legal. Making it an error would make
+    the answer depend on *when* the mount happened — a subtree that isolates
+    `shell` before the plugin providing `shell` has loaded is the ordinary case
+    in a tree that mounts concurrently, so the check would fire on correct
+    programs and pass on the same program mounted in a different order. Denial
+    is also a real use: an isolated name nobody provides is how a subtree is
+    refused a capability. The typo stays visible by another route — the consumer
+    that wanted the name is held PENDING with the name in `missing`, and
+    `isolated_names(ctx)` says which names the subtree moved. Turning that pair
+    into a warning ("isolated, never provided, something is waiting on it")
+    belongs to the diagnostics capability, which is where a fact about a stalled
+    tree can be observed without guessing about a tree still being built.

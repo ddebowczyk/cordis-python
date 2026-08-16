@@ -1,0 +1,443 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: hot-reload
+title: Hot reload — a consequence of lifetime discipline, not a feature
+status: implemented
+tier: 3
+summary: >-
+  A plugin that watches source modules and config files and, on change,
+  reimports the affected modules and restarts only the fibers whose code or
+  configuration actually changed — possible only because unload is total.
+
+problem:
+  statement: >-
+    Iterating on a long-lived process — an agent holding a conversation, a
+    server holding connections, a runtime with expensive warm state — costs a
+    full restart per edit. Restarting discards exactly the state that made the
+    process worth iterating on.
+  without_this:
+    - Every code edit costs a full restart and loses in-memory state.
+    - Developers work around it by building ad hoc reload paths per component,
+      each with its own leaks.
+    - The feedback loop is slow enough that people stop making small changes.
+  rejected_alternatives:
+    - option: importlib.reload on changed modules.
+      why_rejected: >-
+        Rebinds module globals but leaves every already-constructed object,
+        registered listener and running task referencing the old code. Without
+        an unload story it produces a process running two versions at once.
+    - option: A supervising process that restarts on change.
+      why_rejected: >-
+        Correct and simple, and remains the right answer when state is cheap.
+        It is not an alternative when the state is the point.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/hmr/src/index.ts
+      symbol: "accepted/declined/stashed, hmr/change, hmr/reload"
+      note: >-
+        Upstream traverses the module job graph, skipping node: builtins and
+        node_modules, to compute which plugins are affected by a changed file.
+    - repo: kb-docs
+      path: modular-software/cordis-in-22-steps.md
+      symbol: "Step 19"
+
+depends_on: [declarative-loader, fiber-lifecycle, effect-scope, diagnostics]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      On a source change, the set of affected plugins is computed by walking
+      the import graph from the changed module to every mounted plugin target,
+      excluding standard-library and site-packages modules.
+    rationale: >-
+      Reloading everything defeats the purpose; reloading only the changed
+      module leaves stale importers.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      Affected fibers are fully disposed before any reimport occurs, and
+      remounted from the reimported targets afterwards.
+    rationale: >-
+      Overlapping the old and new instances is how two versions end up
+      registered at once.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      After a reload, the number of registered listeners, live services, and
+      tracked resources attributable to each reloaded fiber equals what it had
+      after its first load.
+    rationale: >-
+      Accumulation across reloads is the defining failure of every hand-rolled
+      reload system, and it is silent until the tenth save.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      A reload whose new code fails leaves the failed fiber FAILED, reports the
+      error with the module path, and leaves every unaffected fiber running.
+    rationale: >-
+      An edit with a syntax error must not take down the session being
+      iterated on.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      A module may decline reload, in which case a change to it escalates to
+      its importers; if the escalation reaches the root, the reload is refused
+      and reported rather than performed partially.
+    rationale: >-
+      Some state genuinely cannot be reconstructed; the honest answer is to
+      refuse and say so.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      A config file change is handled by the loader's ordinary reconciliation,
+      not by a separate path.
+    rationale: >-
+      Two reconciliation implementations will disagree; the loader's diff is
+      already the correct mechanism.
+
+  - id: SEM-007
+    kind: MUST
+    rule: >-
+      Reloads are serialised: a change arriving while a reload is in progress
+      is queued and coalesced, never applied concurrently.
+    rationale: >-
+      Editors write files in bursts; concurrent reloads of overlapping sets
+      interleave disposal and mounting unpredictably.
+
+python_design:
+  module: cordis.hmr
+  surface:
+    - "RELOAD_FLAG: Final = '__cordis_reload__'  # module-level opt-out (SEM-005)"
+    - "def project_module(path: Path, /, *, root: Path | None = None) -> str | None"
+    - "def imports_of(name: str, /, *, root: Path | None = None) -> frozenset[str]"
+    - "def import_graph(names: Iterable[str] | None = None, /, *, root: Path | None = None) -> dict[str, frozenset[str]]"
+    - "def affected(changed: Iterable[str], graph: Mapping[str, frozenset[str]], /) -> frozenset[str]"
+    - "def declines(name: str, /) -> bool"
+    - "def escalated(names: Iterable[str], graph: Mapping[str, frozenset[str]], /) -> tuple[frozenset[str], frozenset[str]]  # (reloadable, refused)"
+    - "def reload_order(names: Iterable[str], graph: Mapping[str, frozenset[str]], /) -> tuple[str, ...]  # dependencies first"
+    - "@dataclass(frozen=True, slots=True)\nclass ReloadFailure:\n    module: str\n    error: BaseException"
+    - "@dataclass(frozen=True, slots=True)\nclass ReloadReport:\n    changed / reloaded / refused: tuple[str, ...]\n    entries: ReconcileReport | None = None\n    failed: tuple[ReloadFailure, ...] = ()\n    @property\n    def quiet(self) -> bool\n    @property\n    def refused_reload(self) -> bool"
+    - "@inject('loader')\nclass HmrService(Service):\n    name = 'hmr'  # config: {'root': str} -- the project root, default cwd"
+    - "    async def reload(self, changed: Sequence[str | Path], /) -> ReloadReport"
+    - "    def entries_for(self, modules: Collection[str], /) -> tuple[str, ...]"
+    - "    def follow(self, path: Path, source: FileSource, /) -> Callable[[], None]"
+    - "    def watch(self, paths: Sequence[Path], /, *, every: float = 1.0, on_error: Report | None = None) -> Schedule"
+    - "    def on_reload(self, handler: Callable[[ReloadReport], object], /) -> Callable[[], None]"
+  idioms:
+    - >-
+      Reimport is `importlib.reload` on the affected modules in reverse
+      topological order, after disposal — order matters because a module
+      reloaded before its dependency would capture the old dependency.
+    - >-
+      Disposal, reimport and remount are one call into the loader:
+      `loader.remount(paths, between=reimport)`. The loader owns the tree, so
+      the ordering SEM-002 demands is expressed where the tree is, rather than
+      in a second place that has to agree with it.
+    - >-
+      A config file is followed by registering the `FileSource` that reads it,
+      and a change to it calls `loader.reconcile(source.read())` — literally
+      the loader's own path (SEM-006), not a diff of its own.
+    - >-
+      Refusal is total. An escalation that reaches a module nothing imports
+      reloads nothing at all and says which module refused, because a partial
+      reload of a set the author declined is the outcome SEM-005 exists to
+      prevent.
+  typing_notes:
+    - >-
+      `ReloadReport` mirrors `ReconcileReport` — tuples of names, a `quiet`
+      property — and carries the `ReconcileReport` itself when the reload went
+      through the loader, so tooling can consume both uniformly.
+  concurrency:
+    - >-
+      One reload runs at a time. A caller arriving while one is in flight adds
+      its paths to a pending union and waits for the run that will include
+      them, so a burst of changes becomes exactly one further reload of the
+      union (SEM-007) and every caller gets the report of the run that carried
+      its change.
+  deviations:
+    - >-
+      No file watcher is shipped. `reload(paths)` is the capability and it is
+      public, so a real watcher — watchdog, an editor plugin, a CI hook —
+      drives it; `watch()` is a polling loop built on the Clock (capability
+      13), which is dependency-free and, being on the clock, testable under the
+      virtual one. Upstream's HMR is welded to a bundler's own file
+      notifications, which is not a thing a library can port.
+    - >-
+      The import graph is read by parsing each project module's source with
+      `ast`, not by an import hook. A hook records exactly what was imported,
+      but only for modules imported *after* it is installed, which for a plugin
+      mounted into a running application is nearly none of them. The AST scan
+      sees module-level and function-level `import` and `from` statements in
+      the project's own files. What it cannot see is an import by computed
+      name; such a module has no in-edge, and a module that depends on one
+      declares `__cordis_reload__ = False` so a change escalates rather than
+      being missed.
+    - >-
+      "Excluding standard-library and site-packages modules" (SEM-001) is
+      implemented as "inside the project root", where the root is the working
+      directory unless one is passed. A path test is decidable and cheap; the
+      alternative, a list of prefixes to exclude, is a list that is wrong on
+      the first unusual installation layout.
+    - >-
+      The affected set is intersected with the entries the loader mounted. A
+      plugin mounted by hand from application code carries no recipe anything
+      can replay, so hot reload leaves it alone rather than disposing a fiber
+      that cannot be rebuilt. This is SEM-006 taken to its conclusion: the
+      loader is the thing that knows how to build the tree, so it is the thing
+      that rebuilds it.
+    - >-
+      SEM-004's "leaves the failed fiber FAILED" is satisfied in two shapes,
+      because failure has two. New code that raises when *applied* leaves a
+      mounted, FAILED fiber, reported by the loader as `start failed`. New
+      code that will not *import* leaves no fiber at all: there is nothing to
+      mount, and the entry is reported as an `unresolvable target`. The half-
+      executed module is dropped from `sys.modules` rather than kept, so a
+      corrected save re-imports cleanly and the broken entry fails now instead
+      of quietly mounting whatever survived the crash. Both shapes name the
+      module and neither touches an unaffected fiber, which is what SEM-004
+      exists to protect.
+    - >-
+      A module's cached bytecode is deleted before it is reimported. Python
+      decides a `.pyc` is current from the source's size and its modification
+      time *in whole seconds*, so two saves inside one second that leave the
+      file the same length — flipping a constant, fixing a character — are
+      indistinguishable to that check and `importlib.reload` re-executes the
+      old bytecode. A reload that silently does nothing is worse than no
+      reload at all; one compile is a cheap price for the flag meaning what it
+      says.
+    - >-
+      Reloads are announced on the service's own channel (`on_reload`), not on
+      the event bus. The port binds no ambient bus -- a `PluginHost` has a
+      registry and a runtime, and a bus is a thing an application constructs
+      and hands around -- so a service that dispatched events would first have
+      to invent a convention for finding one. The seam capability already made
+      this call for registry changes (19's "a `Registry` is a plain object that
+      a Definition package can own without a `Host`"), and hot reload is in the
+      same position: `reload()` returns its report to its caller, and `watch()`
+      -- which has no caller to return to -- feeds the handlers. An application
+      that wants these on a bus emits them from its own handler in one line.
+    - >-
+      Refusal aborts the whole run, including the config half. A call that
+      carries both a declined module and a changed config file does nothing at
+      all, because PROP-HMR-005 asks for every fiber to be identical by `is`
+      after a refusal, and a reconcile performed alongside is a fiber that is
+      not. "The reload is refused rather than performed partially" (SEM-005) is
+      read as being about the run, not about the module half of it.
+    - >-
+      SEM-003 is verified by PROP-HMR-001 rather than asserted at runtime in
+      development builds. The runtime check would need every fiber's first-load
+      snapshot held for the life of the process; the property test compares the
+      same counts across generated reload sequences and costs a running
+      application nothing.
+
+properties:
+
+  - id: PROP-HMR-001
+    claim: >-
+      Reloading a fiber any number of times leaves its listener count, service
+      binding count and resource ledger identical to its state after the first
+      load.
+    shape: conservation
+    evidence: [SEM-002, SEM-003]
+    domain:
+      generates: >-
+        A plugin tree whose plugins register generated numbers of listeners,
+        services and resources, plus a generated sequence of 1-10 reloads over
+        generated subsets.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Per-fiber counts after each reload equal the counts captured after the
+        first load.
+      independence: >-
+        Counts come from a real event bus, the host's registry and the
+        external resource ledger, none of which the reload path writes to.
+    failure_value: >-
+      Disposing the fiber but not its child scopes before remounting, so each
+      save doubles the handlers and by the tenth edit every keystroke is
+      processed ten times.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_hmr.py::test_reloading_any_number_of_times_conserves_what_was_registered
+    notes: >-
+      Each generated plugin parks its resources in *its own module*, and the
+      undo reaches them through a global lookup rather than a captured
+      reference. That is what makes SEM-002's ordering observable at all: a
+      reimport performed before disposal rebinds the module's state, the undo
+      then finds nothing to undo, and the ledger records a resource that was
+      acquired and never released. With the resources held in the test's own
+      objects instead, disposal-before-reimport and reimport-before-disposal
+      are indistinguishable, and this card would pass against both.
+
+  - id: PROP-HMR-002
+    claim: >-
+      Only fibers whose targets are reachable from a changed module in the
+      import graph are disposed and remounted.
+    shape: differential
+    evidence: [SEM-001]
+    domain:
+      generates: >-
+        A synthetic module graph (DAG) written as real `.py` files under a
+        temporary root and imported, with plugins at generated nodes, plus a
+        generated changed node.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The expected affected set is computed by the test with a reverse
+        reachability walk over the generated graph.
+      independence: >-
+        The walk uses the generator's own edge list, not the runtime's importer
+        map.
+    failure_value: >-
+      Reloading every plugin on any change, which is correct but discards the
+      state hot reload exists to preserve — a "working" implementation that
+      provides none of the value.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_hmr.py::test_only_what_imports_the_change_is_rebuilt
+    notes: >-
+      Real modules rather than a mocked graph: the thing under test is whether
+      the port can read a Python program's import structure at all, and a
+      hand-supplied edge list would test the reachability walk while assuming
+      away the part that can be wrong.
+
+  - id: PROP-HMR-003
+    claim: >-
+      A reload whose new code raises leaves that fiber FAILED and every
+      unaffected fiber untouched by identity.
+    shape: safety
+    evidence: [SEM-004]
+    domain:
+      generates: A plugin tree plus a generated change that makes a generated subset of targets raise on import or on apply.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Unaffected fibers compare identical by `is` to handles captured before
+        the reload; affected ones are FAILED with the module path in the report.
+      independence: "Identity comparison against pre-captured handles."
+    failure_value: >-
+      A syntax error in one file cancelling the reload task group and taking
+      down the whole tree, so the session being iterated on is lost by the very
+      mechanism meant to preserve it.
+    test_tier: local
+    status: passing
+    test_id: tests/test_hmr.py::test_a_reload_that_fails_takes_only_its_own_fibers
+    notes: >-
+      Both failure modes are generated, because they end differently: code
+      that raises when applied leaves a mounted FAILED fiber, code that will
+      not import leaves none. The claim the card actually makes is the same
+      either way — the entry is named and no unaffected fiber moved — so the
+      test asserts identity on the survivors and accepts either shape for the
+      casualty. See the deviation on SEM-004's two shapes.
+
+  - id: PROP-HMR-004
+    claim: >-
+      A burst of changes arriving during a reload produces exactly one
+      subsequent reload covering their union, never overlapping reloads.
+    shape: safety
+    evidence: [SEM-007]
+    domain:
+      generates: >-
+        A generated set of concurrent `reload` calls over generated subsets of
+        the changed modules, released together while one reload is held open
+        inside a plugin body.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        A concurrency counter around the reload body never exceeds 1, and the
+        union of reloaded targets equals the union of the affected sets of all
+        change events.
+      independence: >-
+        The expected union is computed from the generated events; the
+        concurrency counter is external instrumentation.
+    failure_value: >-
+      An editor writing three files in quick succession triggering three
+      interleaved reloads, where the second disposes a fiber the third is
+      halfway through mounting.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_hmr.py::test_a_burst_during_a_reload_becomes_exactly_one_more_reload
+    notes: >-
+      Driven by concurrent callers rather than by the virtual clock: the port
+      ships no watcher, so coalescing is a property of `reload` itself and the
+      clock would only be simulating the caller. Holding one reload open inside
+      a mounted body is what makes the overlap window real rather than timed.
+
+  - id: PROP-HMR-005
+    claim: >-
+      A change to a module that declines reload escalates to its importers, and
+      a refusal leaves the entire tree untouched.
+    shape: safety
+    evidence: [SEM-005]
+    domain:
+      generates: A module graph with a generated subset of modules declining reload, plus a generated changed node.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The expected outcome — an escalated affected set, or a refusal — is
+        computed by the test walking importers until a non-declining boundary
+        or the root is reached; on refusal, every fiber must be identical by
+        `is`.
+      independence: "The escalation walk uses the generator's own graph."
+    failure_value: >-
+      Reloading a module that declared itself non-reloadable, discarding a
+      warm cache or an open connection pool the author explicitly protected.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_hmr.py::test_a_declining_module_escalates_or_refuses
+
+  - id: PROP-HMR-006
+    claim: >-
+      A config file change produces exactly the same tree as calling the
+      loader's reconcile with the new entry list directly.
+    shape: differential
+    evidence: [SEM-006]
+    domain:
+      generates: A base entry list plus a generated edited version of it, applied once through the file watcher and once through reconcile.
+    preconditions: []
+    oracle:
+      kind: metamorphic
+      description: >-
+        Diagnostics snapshots of the two runs, taken in fresh roots, must be
+        equal modulo fiber identities.
+      independence: >-
+        Two independent runs whose only shared input is the entry list; the
+        watcher path and the direct path are separate code paths in the caller.
+    failure_value: >-
+      The watcher implementing its own diff, which drifts from the loader's, so
+      a config edit applied by saving the file produces a different tree than
+      the same edit applied programmatically.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_hmr.py::test_a_config_file_change_is_the_loaders_own_reconcile
+
+open_questions:
+  - >-
+    Resolved: shipped. The worry was that hot reload would be invasive, and it
+    was not — the whole capability is 500 lines that read the import graph and
+    make one call into the loader, and the two kernel changes it needed
+    (`PluginHandle.form`, `LoaderService.remount`) are both things the loader
+    and diagnostics wanted anyway. That it *could* be built this small is the
+    evidence for the claim the record opens with: hot reload is a consequence
+    of lifetime discipline, not a feature.
+  - >-
+    Whether the import graph should be cached between reloads. It is rebuilt
+    from scratch on every call, which parses every project module. For a few
+    hundred modules that is milliseconds and invisible next to the disposal
+    and remount; for a large application on a slow disk it may not be. The
+    cache is easy — invalidate on mtime — and deliberately not written until
+    there is a measurement asking for it.

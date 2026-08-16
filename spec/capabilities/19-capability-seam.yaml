@@ -1,0 +1,431 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: capability-seam
+title: Capability seam — the three-role split that makes providers swappable
+status: implemented
+tier: 3
+summary: >-
+  The packaging discipline that makes the runtime's substitution machinery
+  actually usable: a Definition owns the service name and its request/result
+  types, Providers implement it, Consumers depend on it, and neither Provider
+  nor Consumer ever depends on the other.
+
+problem:
+  statement: >-
+    Runtime substitution is worthless if consumers import providers. The
+    framework can swap an implementation, but if the consumer's module imported
+    the provider's module to get a type, the dependency survives the swap and
+    the two are welded together at build time regardless of what happens at
+    runtime.
+  without_this:
+    - Replacing an implementation requires editing or forking every consumer.
+    - Types and the registry name live in different packages and drift, so a
+      consumer type-checks against one contract and calls another.
+    - Pointing a subsystem at a sandbox or a remote host means forking every
+      tool that uses it.
+  rejected_alternatives:
+    - option: A bare Protocol as the contract.
+      why_rejected: >-
+        A Protocol carries types but not the registry name, so the two halves
+        of the contract live in separate places and drift. The Definition is an
+        abstract Service class precisely so the name and the types are one
+        artefact.
+    - option: Split every service into three packages preemptively.
+      why_rejected: >-
+        A seam has a cost. Splitting before there is a second provider or a
+        third consumer buys nothing and triples the packaging. One package may
+        own several roles until the seam is needed.
+
+origin:
+  references:
+    - repo: deepseek-harness
+      path: docs/capability-seams.md
+    - repo: deepseek-harness
+      path: packages/llm/llm/src/index.ts
+      symbol: "LlmRuntime.registerAdapter"
+      note: "The reference registry shape: validate into a candidate, commit in one synchronous section, yield the disposer."
+    - repo: kb-docs
+      path: modular-software/cordis-in-22-steps.md
+      symbol: "Steps 21-22"
+
+depends_on: [service-registry, dependency-injection, config-validation, effect-scope]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      A Definition is an abstract Service subclass that owns the registry name
+      and declares the request and result types of the capability. It contains
+      no implementation and imports no provider.
+    rationale: >-
+      One artefact holding both halves of the contract is what prevents the
+      name and the types from drifting.
+
+  - id: SEM-002
+    kind: MUST-NOT
+    rule: >-
+      A Provider MUST NOT import any Consumer, and a Consumer MUST NOT import
+      any Provider. Both import only the Definition.
+    rationale: >-
+      This is the seam. Every other rule here is in service of it.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      Configuration defaults are resolved by an explicit function producing a
+      fully-populated resolved specification, not by inline fallbacks at each
+      use site.
+    rationale: >-
+      Inline `or default` expressions scatter the effective default across the
+      implementation, so no single place answers what the default is — and two
+      of them are eventually different.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      A registry provided by a capability registers entries as effects using
+      validate-then-commit: the candidate is fully validated before any shared
+      state is mutated, the mutation happens in one synchronous section, and
+      the disposer is yielded from the same effect.
+    rationale: >-
+      A rejected candidate must leave the registry exactly as it was, and no
+      observer may see a half-committed state.
+
+  - id: SEM-005
+    kind: MUST-NOT
+    rule: >-
+      A registry MUST NOT require callers to remember to unregister; the
+      caller's own scope owns the removal.
+    rationale: >-
+      Any API whose correct use depends on a matching call elsewhere will be
+      used incorrectly.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      Exceptions raised by listeners notified of a registry change are
+      contained: they do not abort the change, and they do not prevent other
+      listeners from being notified.
+    rationale: >-
+      A registry mutation that half-fails because an observer threw is the
+      worst possible state to leave shared state in.
+
+  - id: SEM-007
+    kind: SHOULD
+    rule: >-
+      Events belong to the service that owns the domain, not to a shared bus
+      module; extension points are events, direct capability calls are service
+      methods.
+    rationale: >-
+      A shared bus module becomes a dependency of everything and an
+      architectural bottleneck; ownership keeps the event catalogue navigable.
+
+python_design:
+  module: cordis.seam
+  surface:
+    - "class Definition(Service, abc.ABC, abstract=True):    # owns the name and the types"
+    - "    @classmethod\n    def of(cls, ctx: Context, /) -> Self: ...    # the bound provider, typed as the contract"
+    - "@dataclass(frozen=True, slots=True)\nclass Candidate(Generic[T]):\n    key: str\n    item: T"
+    - "@dataclass(frozen=True, slots=True)\nclass RegistryChange(Generic[T]):\n    kind: ChangeKind\n    key: str\n    item: T"
+    - "@dataclass(frozen=True, slots=True)\nclass RegistryFailure(Generic[T]):\n    registry: str\n    change: RegistryChange[T]\n    listener: str\n    error: BaseException"
+    - "class Registry(Generic[T], abc.ABC):"
+    - "    def key_of(self, item: T, /) -> str: ...          # abstract; pure, no state"
+    - "    def check(self, item: T, /) -> None: ...          # hook; raises to reject, mutates nothing"
+    - "    def register(self, item: T, /, *, ctx: Context, label: str | None = None) -> EffectHandle"
+    - "    def observe(self, listener: Callable[[RegistryChange[T]], None], /) -> Callable[[], None]"
+    - "    def on_error(self, handler: Callable[[RegistryFailure[T]], None], /) -> Callable[[], None]"
+    - "    def get(self, key: str, /) -> T | None"
+    - "    def entries(self) -> Mapping[str, T]"
+    - "    def __len__(self) -> int"
+    - "    def _validate(self, item: T, /) -> Candidate[T]     # key_of -> conflict -> check; mutates nothing"
+    - "    def _commit(self, candidate: Candidate[T], /) -> None    # synchronous, total"
+    - "    def _release(self, candidate: Candidate[T], /) -> bool   # removes only its own entry"
+    - "UNSET: Any  # 'this field has no default; something must fill it before use'"
+    - "def resolve_spec(spec: type[T], raw: object = None, /, *, plugin: str | None = None) -> T"
+  idioms:
+    - >-
+      `Registry.register` is implemented once in the base class as an effect
+      body calling validate -> commit -> notify and returning the undo, so
+      every registry in an application gets SEM-004 and SEM-005 without
+      reimplementing them and without an author being able to get the order
+      wrong. What a subclass supplies is `key_of` (what is this thing called)
+      and optionally `check` (is it acceptable) -- neither of which can touch
+      shared state.
+    - >-
+      Definitions are `abc.ABC` subclasses, so a Provider that fails to
+      implement a method fails at class definition rather than at first call.
+    - >-
+      Notification containment is the shape `EventBus` and `LoggingService`
+      already use: every listener runs, failures go to an `on_error` channel,
+      and with no handler installed the traceback goes to stderr. Silence is
+      the one unacceptable option, since the mutation deliberately does not
+      fail.
+    - >-
+      `resolve_spec` is `from_dataclass` plus a totality scan. Ordinary
+      dataclass defaults are the single place a default lives -- config
+      validation already applies them -- and `UNSET` marks a field that has no
+      default, so "resolved" means "no field is still a sentinel" and the check
+      is generic over the dataclass rather than a hand-written field list.
+    - >-
+      Packaging convention: `<cap>` (Definition), `<cap>-<impl>` (Provider),
+      consumers named for what they do. The Definition package has no runtime
+      dependency on the framework beyond the type-only import.
+  typing_notes:
+    - >-
+      Request and result types live on the Definition as nested dataclasses or
+      module-level types exported from the Definition package, so a Consumer
+      importing the Definition gets the full contract in one import.
+    - >-
+      `Definition.of(ctx)` exists because `ctx.require(SomeDefinition)` does
+      not type-check: `require` takes `type[T]`, which asserts the class is
+      instantiable, and a Definition is abstract by SEM-001. Under
+      `mypy --strict` every Consumer in the seam would need a
+      `type-abstract` suppression on the one line the seam exists for. The
+      classmethod resolves by `cls.name` -- the string path, which has no such
+      constraint -- and returns `Self`, so a Consumer gets the contract's type
+      with no suppression and no cast of its own. The single cast lives here,
+      where SEM-001 makes it true.
+    - >-
+      `Registry` is `Generic[T]` with `T` invariant and `key_of` abstract, so
+      the item type is pinned at the subclass and `entries()` hands back
+      `Mapping[str, T]` rather than `Mapping[str, Any]` to the consumer.
+    - >-
+      `Generic[T]` and `TypeVar` rather than PEP 695 syntax: the port targets
+      Python 3.11, where `class Registry[T]` is a syntax error.
+  concurrency:
+    - >-
+      `_commit` must be synchronous by signature, which makes SEM-004's atomicity
+      checkable by inspection rather than by reasoning about await points.
+  deviations:
+    - >-
+      `Definition` cannot be written as the record's `class Definition(Service,
+      abc.ABC)` unchanged: `Service.__init_subclass__` (service-registry
+      SEM-007) demands a non-empty `name` from every subclass at class-creation
+      time, and the framework's own abstract base has no registry name to
+      declare. The kernel is widened by one keyword -- `class D(Service,
+      abstract=True)` skips the check -- which is opt-in, per-class (a class
+      keyword is not inherited), and leaves the concrete Provider still obliged
+      to declare or inherit a name. Recorded against service-registry as well.
+    - >-
+      `register` returns the `EffectHandle` from `EffectScope.effect`, not a
+      bare disposer. Every other registration in the port returns one, and the
+      handle is what makes the removal the caller's scope's business rather
+      than the caller's (SEM-005).
+    - >-
+      `_validate`, `_commit` and `_release` are concrete in the base and
+      `key_of` is the abstract method instead. The record's three-abstract-hook
+      shape makes every registry re-derive the duplicate-key check inside
+      `_validate` -- which is the one place SEM-004 says a mutation must not
+      happen -- so the base owns the ordering and the subclass owns only pure
+      questions. All three stay overridable for a registry that needs a second
+      index.
+    - >-
+      Change notifications do not go through the event bus. A `Registry` is a
+      plain object that a Definition package can own without a `Host`, and
+      requiring a bus to satisfy SEM-006 would make the seam depend on the
+      runtime it exists to keep out. SEM-007 is satisfied by the registry
+      owning its own channel; a capability that wants domain events on the bus
+      still emits them itself.
+    - >-
+      `resolve_spec` takes the spec *type* and the raw value, rather than a
+      config instance: the resolver has to be able to say "this field was never
+      given and has no default", which a fully-constructed instance can no
+      longer distinguish. Incompleteness is reported as `ConfigValidationError`
+      issues -- every missing field at once, the same currency as every other
+      config failure -- rather than as a new exception type.
+
+properties:
+
+  - id: PROP-SEAM-001
+    claim: >-
+      A registration that fails validation leaves the registry's observable
+      state byte-identical to its state before the attempt.
+    shape: safety
+    evidence: [SEM-004]
+    domain:
+      generates: >-
+        A registry populated with generated valid entries, plus a generated
+        invalid candidate whose invalidity is detected at a generated point
+        during validation.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        A snapshot of the registry's public view before the attempt deep-equals
+        the snapshot after, and every previously registered entry remains
+        resolvable by identity.
+      independence: >-
+        The pre-snapshot is a deep copy taken before the attempt; identity
+        checks use handles captured earlier.
+    failure_value: >-
+      Validation interleaved with insertion — appending an entry and then
+      checking a cross-entry constraint — so a rejected tool leaves a partial
+      index entry that shadows a valid tool of the same name.
+    test_tier: local
+    notes: >-
+      The generated fault is detected at one of three points -- deriving the
+      key, the duplicate check, the acceptability hook -- so "nothing was
+      mutated" is asserted about every stage of validation rather than the
+      first one. The post-state is compared both by value against a deep copy
+      and by identity per entry: an implementation that rebuilt the dict from
+      equal-but-new objects would have moved exactly what must not move. The
+      card's oracle is extended by one clause the record did not name -- no
+      listener heard anything -- because a rejected candidate that announces
+      itself leaves observers describing a registry that never existed.
+    status: passing
+    test_id: tests/test_seam.py::test_a_rejected_candidate_changes_nothing
+
+  - id: PROP-SEAM-002
+    claim: >-
+      Every registration is removed when the registering scope is disposed,
+      with no explicit unregister call anywhere.
+    shape: conservation
+    evidence: [SEM-005]
+    domain:
+      generates: A plugin tree whose plugins register generated entries into a shared registry, plus a generated disposal order.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        The registry's entry set always equals the union of entries registered
+        by currently-live scopes.
+      independence: "The expected union is computed from the test's own registration and disposal log."
+    failure_value: >-
+      A registry that returns a disposer but does not tie it to the caller's
+      scope, so every plugin author must remember a cleanup call — and the one
+      that forgets leaves a tool registered pointing at an unloaded provider.
+    test_tier: local
+    notes: >-
+      The plugins are real mounts and the entries are registered from inside
+      their bodies, so the disposal being tested is an ordinary unload rather
+      than a disposer the test kept hold of. Nothing in the test calls an
+      unregister, which is the point: there is none to call.
+    status: passing
+    test_id: tests/test_seam.py::test_registrations_belong_to_the_scope_that_made_them
+
+  - id: PROP-SEAM-003
+    claim: >-
+      A change listener that raises does not affect the registry mutation or
+      the notification of any other listener.
+    shape: safety
+    evidence: [SEM-006]
+    domain:
+      generates: A registry with a generated set of listeners, a generated subset raising, and a generated sequence of mutations.
+    preconditions:
+      - At least one listener raises; guaranteed by construction.
+    oracle:
+      kind: invariant
+      description: >-
+        The registry's final entry set matches the model regardless of which
+        listeners raised, and non-raising listeners received every
+        notification.
+      independence: >-
+        The model is maintained from the issued mutations; receipt is counted
+        per listener.
+    failure_value: >-
+      A metrics listener throwing on a malformed entry name and aborting the
+      registration transaction, so a cosmetic observer bug prevents a tool from
+      being available.
+    test_tier: local
+    notes: >-
+      Two clauses beyond the record's oracle, both from mutation testing.
+      Every listener's receipt count is compared against the number of
+      mutations issued, which catches a containment that stops the broadcast
+      at the first raiser rather than at none; and the failures delivered to
+      `on_error` are counted and matched, since a runtime that swallowed them
+      entirely would satisfy "the mutation completed" perfectly. The
+      stderr fallback with no handler installed is held by a separate seam
+      test, `test_a_broken_observer_with_no_channel_reaches_stderr`: silence
+      is the one containment failure the card's own oracle cannot see.
+    status: passing
+    test_id: tests/test_seam.py::test_a_broken_observer_derails_nothing
+
+  - id: PROP-SEAM-004
+    claim: >-
+      Swapping the Provider of a Definition leaves every Consumer functioning,
+      with no Consumer code changed and no Consumer importing any Provider.
+    shape: metamorphic
+    evidence: [SEM-001, SEM-002]
+    domain:
+      generates: >-
+        A Definition with 2-4 generated Provider implementations and 1-6
+        Consumers, plus a generated sequence of provider swaps.
+    preconditions: []
+    oracle:
+      kind: metamorphic
+      description: >-
+        After each swap, every Consumer's observable behaviour matches the
+        behaviour predicted from the currently-bound Provider's specification;
+        additionally a static check asserts no Consumer module imports a
+        Provider module.
+      independence: >-
+        The behavioural prediction comes from the generated Provider spec, and
+        the import check reads module `__dict__`s — a structural fact
+        independent of any runtime behaviour.
+    failure_value: >-
+      A Consumer importing a Provider for a type annotation only, which
+      type-checks and runs correctly until the deployment that does not install
+      that Provider, where the Consumer fails at import with a traceback that
+      names neither the seam nor the configuration.
+    test_tier: pr
+    notes: >-
+      The Definition, the Providers and the Consumers are real modules,
+      compiled from generated source into `sys.modules` and discarded
+      afterwards, so the import graph under test is one that actually
+      happened. `depends_on` reads the module `__dict__` rather than parsing
+      the source: both halves of an import land there -- `import x` binds the
+      module, `from x import y` binds an object whose `__module__` names it --
+      which is what catches the type-only import a behavioural test never
+      notices. The check is guarded against vacuity in both directions: each
+      role must be shown to reach the Definition, or "reaches no Provider"
+      would be satisfied by a module that imports nothing at all. Providers
+      are checked for the symmetric direction too, which the card names in
+      SEM-002 but its oracle did not.
+    status: passing
+    test_id: tests/test_seam.py::test_swapping_the_provider_leaves_every_consumer_working
+
+  - id: PROP-SEAM-005
+    claim: >-
+      Resolving a configuration yields a fully-populated specification in which
+      every field has a value, and resolution is total over all valid configs.
+    shape: safety
+    evidence: [SEM-003]
+    domain:
+      generates: Valid configs with generated subsets of optional fields omitted.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Every field of the resolved specification is non-sentinel, and
+        resolving the resolved specification again returns an equal value.
+      independence: >-
+        Field completeness is checked by iterating the dataclass fields
+        generically, not against a hand-written list that could drift with the
+        implementation.
+    failure_value: >-
+      A new optional config field added to the schema but not to the resolver,
+      so the resolved specification carries None for it and every use site
+      grows its own inline default — the exact drift SEM-003 exists to prevent.
+    test_tier: local
+    notes: >-
+      Completeness is read off `dataclasses.fields` recursively, so a nested
+      section nobody filled in is a failure and not just an unfilled top-level
+      field; `Partial` in the test carries one of each, which is what stops a
+      top-level-only scan from passing. Idempotency is checked twice over: on
+      the resolved instance, and on the no-argument call, since "total" has to
+      include the config nobody supplied at all.
+    status: passing
+    test_id: tests/test_seam.py::test_resolution_is_total_and_idempotent
+
+open_questions:
+  - >-
+    RESOLVED (implementation): the structural check stays in the test suite.
+    A lint rule needs package boundaries to enforce a direction across, and the
+    port is one package -- `cordis` -- with no Provider or Consumer packages in
+    it to point at. PROP-SEAM-004 therefore builds real modules at test time
+    and reads their `__dict__`s, which checks the rule on generated seams
+    rather than on this repository's layout. The lint rule becomes worth
+    writing at the moment an application splits `<cap>` / `<cap>-<impl>` into
+    real distributions, and is deferred to that point rather than guessed at
+    now.

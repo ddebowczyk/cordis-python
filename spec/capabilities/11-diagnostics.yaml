@@ -1,0 +1,363 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: diagnostics
+title: Diagnostics — the runtime explains itself
+status: implemented
+tier: 2
+summary: >-
+  A read-only introspection surface over the live plugin tree, effect tree,
+  binding set, and listener set, plus composed stacks that name the
+  configuration entry responsible for a failure — because the dominant failure
+  mode of this architecture is silence, not exceptions.
+
+problem:
+  statement: >-
+    The system's defining behaviour is that a plugin missing a dependency does
+    nothing, quietly and legitimately. That makes "my plugin isn't running" the
+    single most common support question, and it is unanswerable without a way
+    to enumerate fibers and see why each one is where it is.
+  without_this:
+    - The first debugging step is adding print statements to framework
+      internals.
+    - A leak is undetectable until memory grows, because nothing enumerates
+      what is registered.
+    - A traceback points into the loader and names no configuration entry, so
+      a failure in a forty-row config gives no clue which row failed.
+  rejected_alternatives:
+    - option: Rely on logging alone.
+      why_rejected: >-
+        Logs answer "what happened"; diagnosis needs "what is true right now".
+        Both are required and they are different surfaces.
+    - option: Debugger-only introspection of private attributes.
+      why_rejected: >-
+        Unusable in production, unusable in tests, and freezes internals into a
+        de facto public API without any of the guarantees.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/core/src/fiber.ts
+      symbol: "Fiber.getEffects, EffectMeta, Context.effect"
+    - repo: cordis
+      path: packages/loader/src/config/entry.ts
+      symbol: "Entry.getOuterStack"
+      note: >-
+        Upstream composes a synthetic stack naming each enclosing config entry,
+        which is what makes a loader-mounted failure traceable to a YAML row.
+    - repo: kb-docs
+      path: modular-software/cordis-cheatsheet.md
+      symbol: "§7 Diagnostics"
+
+depends_on: [fiber-lifecycle, effect-scope, service-registry, event-bus]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      `runtime.inspect()` returns an immutable snapshot of the plugin tree
+      containing, per fiber: identity, plugin name, state, declared
+      dependencies, which of them are unmet, config, and child fibers.
+    rationale: >-
+      "Which dependency is missing" must be a field, not something derived by
+      the reader from two other fields.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      The snapshot is a value: mutating it cannot affect the runtime, and the
+      runtime changing cannot mutate a previously returned snapshot.
+    rationale: >-
+      A diagnostic surface that hands out live internals is an accident waiting
+      to be committed.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      Every effect records the label supplied at registration and the source
+      location of the registration call, and `fiber.effects()` exposes them as
+      a tree mirroring nesting.
+    rationale: >-
+      A leak investigation needs "which line registered the thing that is still
+      alive", and nothing else answers it.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      An exception escaping a plugin body is re-raised with a note naming the
+      chain of enclosing mount sites, including configuration entry identifiers
+      when the mount originated from the loader.
+    rationale: >-
+      A stack that ends in framework internals names the mechanism, not the
+      cause.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      Introspection is free when unused: capturing source locations for effects
+      is controlled by a runtime flag that is on by default and can be disabled
+      without changing any other behaviour.
+    rationale: >-
+      Diagnostics that cost throughput get disabled in production, which is
+      exactly where they are needed; making the cost explicit and small keeps
+      them on.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      `runtime.pending()` returns every fiber in PENDING together with the
+      specific unmet dependency names, transitively attributing each to the
+      root cause where the unmet dependency is itself unprovided because its
+      provider is pending.
+    rationale: >-
+      A cascade of forty pending fibers has one cause; reporting forty is not
+      a diagnosis.
+
+python_design:
+  module: cordis.diagnostics
+  surface:
+    - "@dataclass(frozen=True, slots=True)\nclass FiberSnapshot: uid, label, state, config, requires, provides, unmet, error, effects, children"
+    - "@dataclass(frozen=True, slots=True)\nclass Blockage: name, provider, root   # one unmet name, and who owes it"
+    - "@dataclass(frozen=True, slots=True)\nclass PendingReport: uid, label, blocked"
+    - "def inspect(subject: Fiber | PluginHost, /) -> FiberSnapshot: ..."
+    - "def pending(subject: Fiber | PluginHost, /) -> tuple[PendingReport, ...]: ..."
+    - "def walk(snapshot: FiberSnapshot, /) -> Iterator[FiberSnapshot]: ...   # depth-first, self first"
+    - "def render_tree(snapshot: FiberSnapshot, /, *, style: Literal['text', 'json'] = 'text', effects: bool = False) -> str: ..."
+    - "cordis.fiber: Fiber.uid -- the process-wide serial that identifies an instance"
+    - "already in place: EffectNode(label, location, children) and CAPTURE_LOCATIONS in cordis.effect; mount_attribution / mount_sites / MOUNT_NOTE_PREFIX in cordis.errors"
+    - "def attribute_mount_site(exc: BaseException, label: str, /) -> None   # note the mount an error came from"
+  idioms:
+    - >-
+      Frozen dataclasses with tuple fields for the snapshot types, so SEM-002
+      is enforced by the type rather than by discipline.
+    - >-
+      SEM-004 uses `BaseException.add_note` (3.11+) rather than wrapping, so
+      the original exception type and traceback survive and `except SomeError`
+      in user code keeps working.
+    - >-
+      `render_tree` and `walk` are pure functions of the snapshot, which makes
+      the operator-facing output testable without a running system.
+    - >-
+      Attribution is realm-aware: a pending fiber counts as the provider of an
+      unmet name only when `realm_for` gives the same realm on both sides. An
+      isolated provider is not the answer to a consumer looking in the global
+      realm, and saying it is would send an operator to a plugin that was never
+      going to help.
+  typing_notes:
+    - >-
+      Snapshot types are exported from the package root; they are part of the
+      public API because tooling will consume them.
+  concurrency:
+    - >-
+      `inspect()` walks the tree without awaiting, so the snapshot is
+      consistent with respect to a single point in the event loop.
+  deviations:
+    - >-
+      `inspect`, `pending` and `render_tree` are module-level functions taking
+      the subject rather than methods on a runtime object. The snapshot types
+      would otherwise have to live in `cordis.fiber`, which would make the
+      kernel import its own reporting layer; the dependency runs the other way,
+      the way it does for `scope_of`, `logger` and `clock_of`.
+    - >-
+      SEM-001's "identity" is a new `Fiber.uid`: a process-wide serial assigned
+      at construction. `id()` was the obvious candidate and is wrong for
+      exactly the reason `Fiber._sample` already records -- an id is unique only
+      among live objects, and a snapshot's whole purpose is to outlive the
+      thing it describes, so two snapshots taken across a reload could compare
+      equal on a recycled address. The counter costs one integer per instance.
+      Recorded again in `05-fiber-lifecycle.yaml`, since the field lives there.
+    - >-
+      Three of the six MUSTs were already implemented before this capability
+      was opened: SEM-003 by the label and source location every
+      `EffectScope` record already carries plus `Fiber.effects()`, SEM-004 by
+      `mount_attribution` in plugin mounting, and SEM-005 by
+      `CAPTURE_LOCATIONS`. Diagnostics adds no second mechanism for them; it
+      adds the surface that reads them, and PROP-DIAG-003 and PROP-DIAG-005
+      test them from here as well as from their own capabilities. Where a rule
+      is already satisfied, saying so is the honest record -- reimplementing it
+      to make this capability look bigger would be the alternative.
+    - >-
+      `pending()` reports one `Blockage` per unmet *name* rather than a flat
+      list of names per fiber. SEM-006 asks for attribution to the root cause,
+      and a root cause is a property of a name: one fiber is routinely blocked
+      on one name that nothing provides and another whose provider is itself
+      pending, and those are two different things for an operator to do.
+    - >-
+      `render_tree` takes an `effects` keyword alongside `style`. The effect
+      tree is the answer to a different question from the fiber tree -- "what
+      is still registered" rather than "what is running" -- and printing it
+      always would bury the small tree an operator usually wants under the
+      large one they occasionally do.
+
+properties:
+
+  - id: PROP-DIAG-001
+    claim: >-
+      For every plugin tree, the snapshot's fiber set equals the set of fibers
+      actually created and not disposed, with matching parent-child structure.
+    shape: differential
+    evidence: [SEM-001]
+    domain:
+      generates: A generated nested plugin tree with a generated sequence of disposals.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The test maintains its own tree model from the mount and dispose
+        operations it issued and compares structure and identity sets.
+      independence: >-
+        The model is built from the operations issued, never from the runtime's
+        own tree.
+    failure_value: >-
+      A disposed fiber remaining in the snapshot, so an operator debugging a
+      reload sees a plugin that no longer exists and chases a phantom.
+    notes: >-
+      The comparison is on the name each mount derived, not on the label it
+      composed: a mount label is `<parent>/<name>#<index>` and the index counts
+      every mount the parent has ever minted, which the test's model has no
+      business predicting. Identity is checked separately, on `uid`.
+    test_tier: local
+    status: passing
+    test_id: tests/test_diagnostics.py::test_the_snapshot_is_the_tree_that_is_actually_there
+
+  - id: PROP-DIAG-002
+    claim: >-
+      A fiber is reported as PENDING with unmet dependency set U if and only if
+      U is exactly the set of its declared dependencies that are unbound.
+    shape: state-machine
+    evidence: [SEM-001, SEM-006]
+    domain:
+      generates: The dependency state machine from the injection capability, sampled at quiescent points.
+    preconditions:
+      - Sampled only at quiescence.
+    oracle:
+      kind: model
+      description: >-
+        Expected unmet set computed as declared minus the test's own record of
+        currently provided names.
+      independence: "Both inputs are the test's own construction records."
+    failure_value: >-
+      Reporting the first unmet dependency only, so an operator provides it,
+      restarts, and discovers a second one — repeated for as many dependencies
+      as the plugin declares.
+    notes: >-
+      One card, two tests: `test_id` names the "exactly the unbound names" half,
+      and SEM-006's half — one cause for a cascade of any length — is
+      `test_a_cascade_is_attributed_to_the_end_of_the_chain`, which generates
+      the chain length rather than the dependency sets. Splitting them into two
+      cards would have re-stated the same claim over a different generator.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_diagnostics.py::test_pending_names_every_unmet_dependency_and_only_those
+
+  - id: PROP-DIAG-003
+    claim: >-
+      Every live effect appears exactly once in the effect tree, under the
+      fiber that registered it, with its registration label.
+    shape: conservation
+    evidence: [SEM-003, SEM-005]
+    domain:
+      generates: A plugin tree whose plugins register generated labelled effects, including nested composite effects.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The multiset of labels in the tree equals the multiset of labels the
+        test's plugins registered and have not disposed.
+      independence: >-
+        Labels are chosen by the generator and recorded at registration by the
+        test's own plugin bodies.
+    failure_value: >-
+      Nested composite effects being flattened onto the fiber, so a leak inside
+      one registration is indistinguishable from twenty independent
+      registrations and the actual culprit is unfindable.
+    notes: >-
+      SEM-005 added to the evidence during implementation. The rule says
+      capture can be turned off "without changing any other behaviour", which
+      is a statement about the effect tree and had no card of its own; the test
+      runs each generated plan twice, once with `CAPTURE_LOCATIONS` off, and
+      requires the two trees to differ in the location field and nowhere else.
+      A separate card would have re-generated the same plans to assert half as
+      much.
+
+      The oracle is stronger than the claim's wording implies, and deliberately
+      so: the multiset of labels alone survives the failure value this card
+      names, since flattening a composite preserves every label and destroys
+      only the nesting. The test therefore compares the tree's shape against
+      the one the generated plan asked for, not just its labels.
+    test_tier: local
+    status: passing
+    test_id: tests/test_diagnostics.py::test_every_live_effect_appears_once_under_its_own_fiber
+
+  - id: PROP-DIAG-004
+    claim: >-
+      A snapshot taken before further runtime mutation compares equal to itself
+      afterwards, and no mutation of a snapshot changes any subsequent
+      snapshot.
+    shape: safety
+    evidence: [SEM-002]
+    domain:
+      generates: A plugin tree, a snapshot point, and a generated sequence of subsequent mutations.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Deep equality of the snapshot against a deep copy taken immediately at
+        capture time, checked after the mutations; and attempts to mutate the
+        snapshot raise.
+      independence: >-
+        The deep copy is made by `copy.deepcopy` before any mutation occurs.
+    failure_value: >-
+      Returning the live children list, so a diagnostic tool iterating a
+      snapshot during a reload raises "list changed size during iteration" —
+      a crash in the tool used to debug crashes.
+    notes: >-
+      "No mutation of a snapshot changes any subsequent snapshot" is checked on
+      container identity rather than by editing and re-reading: the copy and
+      the instance's own config must share no dict, list, set or tuple at any
+      depth. Editing only the top level passes against a one-level copy, which
+      is precisely the defect an operator's tool would trip over first.
+    test_tier: local
+    status: passing
+    test_id: tests/test_diagnostics.py::test_a_snapshot_is_a_value_and_stays_one
+
+  - id: PROP-DIAG-005
+    claim: >-
+      An exception escaping a plugin body carries notes naming every enclosing
+      mount site, in order from innermost to outermost, and preserves its
+      original type and traceback.
+    shape: safety
+    evidence: [SEM-004]
+    domain:
+      generates: A nested plugin tree with a generated failing plugin at a generated depth, and a generated exception type.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        Expected note sequence is the path from the failing plugin to the root
+        in the generator's tree; the caught exception's type must be identical
+        to the raised one.
+      independence: >-
+        The path comes from the generated tree; type identity is checked with
+        `is`.
+    failure_value: >-
+      Wrapping the exception in a framework error class, so user code catching
+      its own exception type stops working the moment the plugin is mounted by
+      the loader rather than directly.
+    notes: >-
+      The note sequence is compared on derived names, as in PROP-DIAG-001: the
+      sites are mount labels, and the mint index in one is not the test's to
+      predict.
+    test_tier: local
+    status: passing
+    test_id: tests/test_diagnostics.py::test_a_failure_names_every_mount_that_led_to_it
+
+open_questions:
+  - >-
+    RESOLVED (attribution is realm-aware, and never crosses). A pending fiber
+    counts as the provider of another's unmet name only when `realm_for` gives
+    the same realm for that name on both sides -- the same function a lookup
+    uses, so the report agrees with what resolution would actually do. A
+    consumer blocked on a name whose only declared provider sits in an
+    isolated realm is reported as blocked on a name nothing provides, which is
+    the truth: that provider was never going to satisfy it.

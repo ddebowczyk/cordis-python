@@ -1,0 +1,296 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://github.com/ddebowczyk/cordis-python/spec/schema/capability.v1.yaml"
+title: Cordis-Python Capability Record (v1)
+description: >-
+  One capability of the Cordis model, the problem it solves, its normative
+  semantics, its idiomatic Python realisation, and the property-based tests
+  that hold the implementation to those semantics. Every property entry is a
+  full property card in the sense of ~/projects/_kb-docs/property-based-testing.
+
+type: object
+additionalProperties: false
+required:
+  - schema_version
+  - id
+  - title
+  - status
+  - tier
+  - summary
+  - problem
+  - origin
+  - semantics
+  - python_design
+  - properties
+
+properties:
+
+  $schema:
+    description: >-
+      Optional self-declaration so `ys <file>` validates without -f. Must point
+      at the schema file whose version matches `schema_version`.
+    type: string
+
+  schema_version:
+    description: >-
+      Version of THIS record format. Bumping it is how the spec format evolves
+      without silently reinterpreting older files. A validator selects the
+      schema file by this value.
+    const: capability/v1
+
+  id:
+    description: Stable slug. Never reused, never renamed; deprecate instead.
+    type: string
+    pattern: "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+
+  title:
+    type: string
+    minLength: 3
+    maxLength: 80
+
+  status:
+    description: Lifecycle of the specification, not of the code.
+    enum: [draft, specified, implementing, implemented, deprecated]
+
+  tier:
+    description: >-
+      Build order. 0 = kernel primitive with no cordis-internal dependencies;
+      1 = kernel composition; 2 = runtime services; 3 = application-level
+      composition patterns. A capability may only depend on its own tier or
+      lower.
+    type: integer
+    minimum: 0
+    maximum: 3
+
+  summary:
+    description: One sentence. What the capability is, not why.
+    type: string
+    minLength: 10
+    maxLength: 400
+
+  problem:
+    description: The failure mode that exists when this capability is absent.
+    type: object
+    additionalProperties: false
+    required: [statement, without_this]
+    properties:
+      statement:
+        type: string
+        minLength: 10
+      without_this:
+        description: Concrete consequences of omitting the capability.
+        type: array
+        minItems: 1
+        items: {type: string, minLength: 10}
+      rejected_alternatives:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [option, why_rejected]
+          properties:
+            option: {type: string}
+            why_rejected: {type: string}
+
+  origin:
+    description: Provenance in the TypeScript implementation this port mirrors.
+    type: object
+    additionalProperties: false
+    required: [references]
+    properties:
+      references:
+        type: array
+        minItems: 1
+        items:
+          type: object
+          additionalProperties: false
+          required: [repo, path]
+          properties:
+            repo:
+              enum: [cordis, deepseek-harness, kb-docs]
+            path: {type: string, minLength: 1}
+            symbol: {type: string}
+            note: {type: string}
+
+  depends_on:
+    description: Capability ids that must be implemented first.
+    type: array
+    uniqueItems: true
+    items: {type: string, pattern: "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"}
+
+  semantics:
+    description: >-
+      Normative rules, each independently citable. Property cards reference
+      these ids as evidence; an unreferenced MUST is a coverage gap.
+    type: array
+    minItems: 1
+    items:
+      type: object
+      additionalProperties: false
+      required: [id, kind, rule]
+      properties:
+        id:
+          type: string
+          pattern: "^SEM-[0-9]{3}$"
+        kind:
+          enum: [MUST, MUST-NOT, SHOULD, SHOULD-NOT, MAY]
+        rule: {type: string, minLength: 10}
+        rationale: {type: string}
+        deviation:
+          description: >-
+            Set when this rule intentionally differs from upstream cordis.
+            Absent means "same as upstream".
+          type: object
+          additionalProperties: false
+          required: [upstream, rationale]
+          properties:
+            upstream: {type: string}
+            rationale: {type: string}
+
+  python_design:
+    description: The idiomatic Python realisation.
+    type: object
+    additionalProperties: false
+    required: [module, surface]
+    properties:
+      module:
+        description: Dotted module path that owns this capability.
+        type: string
+        pattern: "^cordis(\\.[a-z_][a-z0-9_]*)*$"
+      surface:
+        description: Public API signatures, as they will appear in source.
+        type: array
+        minItems: 1
+        items: {type: string, minLength: 3}
+      idioms:
+        description: Python-native mechanisms used instead of JS mechanisms.
+        type: array
+        items: {type: string}
+      typing_notes:
+        type: array
+        items: {type: string}
+      concurrency:
+        description: asyncio-specific obligations (cancellation, re-entrancy).
+        type: array
+        items: {type: string}
+      deviations:
+        description: >-
+          Structural departures from upstream cordis that belong to the design
+          rather than to any single rule — a name that moved, an owner that
+          changed, a type that has no upstream analogue. Rule-level differences
+          stay in `semantics[].deviation`. Added after capability/v1 shipped;
+          optional, so every document written against the original v1 still
+          validates and the version does not move.
+        type: array
+        items: {type: string}
+
+  properties:
+    description: Property cards. Each drives at least one Hypothesis test.
+    type: array
+    minItems: 1
+    items: {$ref: "#/$defs/propertyCard"}
+
+  open_questions:
+    type: array
+    items: {type: string}
+
+$defs:
+
+  propertyCard:
+    type: object
+    additionalProperties: false
+    required:
+      - id
+      - claim
+      - shape
+      - evidence
+      - domain
+      - oracle
+      - failure_value
+      - test_tier
+      - status
+    properties:
+
+      id:
+        type: string
+        pattern: "^PROP-[A-Z0-9]+(-[A-Z0-9]+)*-[0-9]{3}$"
+
+      claim:
+        description: >-
+          Exactly one falsifiable sentence about all inputs in the domain.
+          If it needs "and", it is two properties.
+        type: string
+        minLength: 15
+        maxLength: 400
+
+      shape:
+        enum:
+          - roundtrip
+          - differential
+          - idempotency
+          - safety
+          - conservation
+          - monotonicity
+          - state-machine
+          - metamorphic
+
+      evidence:
+        description: Which normative rules this property is derived from.
+        type: array
+        minItems: 1
+        items: {type: string, pattern: "^SEM-[0-9]{3}$"}
+
+      domain:
+        description: >-
+          The generator. State what is generated and, explicitly, what is
+          excluded — an unstated exclusion is an untested region.
+        type: object
+        additionalProperties: false
+        required: [generates]
+        properties:
+          generates: {type: string, minLength: 10}
+          excludes:
+            type: array
+            items: {type: string}
+          strategy_hint:
+            description: Hypothesis strategy sketch; direct construction preferred.
+            type: string
+
+      preconditions:
+        description: >-
+          Filters applied to generated values. Prefer constructing valid values
+          directly; every entry here is a discard-rate risk.
+        type: array
+        items: {type: string}
+
+      oracle:
+        type: object
+        additionalProperties: false
+        required: [kind, description, independence]
+        properties:
+          kind:
+            enum: [invariant, model, reference, metamorphic, roundtrip]
+          description: {type: string, minLength: 10}
+          independence:
+            description: >-
+              Why the oracle cannot fail in the same way as the implementation.
+              "Calls the same function" is not an oracle.
+            type: string
+            minLength: 15
+
+      failure_value:
+        description: A real defect this property would catch. Not a restatement.
+        type: string
+        minLength: 15
+
+      test_tier:
+        enum: [local, pr, nightly, release]
+
+      status:
+        enum: [proposed, generator-ready, implemented, passing, quarantined]
+
+      test_id:
+        description: pytest node id once implemented.
+        type: string
+
+      notes:
+        type: string

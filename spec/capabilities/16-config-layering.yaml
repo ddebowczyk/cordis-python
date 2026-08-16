@@ -1,0 +1,347 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: config-layering
+title: Config layering — bundles, profiles, and patches compose into one tree
+status: implemented
+tier: 3
+summary: >-
+  An ordered sequence of patch layers is folded onto a base entry list, where
+  each patch targets entries by id to replace fields or insert rows — turning
+  product packaging, deployment profiles, and user customisation into the same
+  mechanism.
+
+problem:
+  statement: >-
+    A product built from plugins needs several independent parties to influence
+    what loads: the vendor ships bundles, an operator selects a deployment
+    profile, a user has machine-level preferences, and a command line overrides
+    one thing for one run. Without a defined composition, each party needs its
+    own copy of the whole config and they drift apart immediately.
+  without_this:
+    - Every deployment variant is a full copy of the configuration, so a fix to
+      a shared row must be applied n times.
+    - User customisation means editing a vendor-shipped file, which the next
+      upgrade overwrites.
+    - There is no artefact showing what the layers produced, so debugging a
+      deployment means mentally replaying the merge.
+  rejected_alternatives:
+    - option: Deep merge of nested config values.
+      why_rejected: >-
+        Ambiguous for lists (append, replace, or merge by index?) and for
+        explicit nulls, and it makes "what is my effective config" impossible
+        to determine without running the merge. Whole-value replacement is
+        blunt but always predictable.
+    - option: One file with conditional sections.
+      why_rejected: >-
+        Puts every variant in one artefact that no single party owns, and grows
+        conditionals faster than variants.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/include/src/index.ts
+      symbol: "PatchOptions, applyPatches"
+    - repo: deepseek-harness
+      path: packages/bundle/base/cordis.patch.yml
+    - repo: kb-docs
+      path: modular-software/cordis-in-22-steps.md
+      symbol: "Step 18"
+
+depends_on: [declarative-loader]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      Layers are applied in a declared total order; the resulting entry list is
+      a pure function of the base list and the ordered layers.
+    rationale: >-
+      Purity is what makes the resolved tree reproducible and printable without
+      starting the application.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      A patch targeting an id replaces the named fields of that entry
+      wholesale. It never deep-merges; setting `config` replaces the entire
+      config value.
+    rationale: >-
+      Predictability over convenience. A partial override is expressed by
+      restating the whole value, which is visible in review.
+
+  - id: SEM-003
+    kind: MUST
+    rule: >-
+      A patch with `insert` adds entries, either at the end of the root list or
+      into the group named by its `id`; inserting into a non-group id is an
+      error.
+    rationale: >-
+      Extension by a downstream layer must not require restating the rows it is
+      extending.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      A patch targeting an id that does not exist is an error naming the id and
+      the layer, not a silent no-op.
+    rationale: >-
+      Upstream logs a warning and continues, so a renamed entry silently drops
+      every downstream customisation of it. Failing loudly is the difference
+      between a five-minute and a multi-hour investigation.
+    deviation:
+      upstream: "Upstream warns and skips."
+      rationale: >-
+        A skipped patch is indistinguishable from an applied one at runtime.
+        Strictness is affordable because the resolved tree is printable and the
+        error names both id and layer.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      A patch may carry an expected `name`; if the target entry's name differs,
+      the patch fails naming both.
+    rationale: >-
+      An id can be reused for a different plugin between versions; the name
+      check makes that a loud failure rather than a patch applied to the wrong
+      thing.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      The resolved entry list is obtainable without mounting anything, and the
+      resolution reports, per entry and per field, which layer last wrote it.
+    rationale: >-
+      Provenance is what makes a layered system debuggable. Without it, layering
+      is a maintenance liability.
+
+  - id: SEM-007
+    kind: MUST
+    rule: >-
+      Applying an empty layer, or a layer whose patches all reproduce existing
+      values, yields a list equal to the input.
+    rationale: >-
+      Neutral elements must actually be neutral, or layering churns the tree on
+      every reload.
+
+python_design:
+  module: cordis.layering
+  surface:
+    - "BASE: Final = '<base>'   # the layer name every unpatched field carries"
+    - "Fields: TypeAlias = Mapping[str, object]"
+    - "@dataclass(frozen=True, slots=True)\nclass Patch:\n    id: str | None = None        # the dotted path of the entry it targets\n    name: str | None = None      # the name that entry is expected to have\n    fields: Fields = ...         # whole-value replacements, never a merge\n    insert: tuple[Entry, ...] = ()"
+    - "@dataclass(frozen=True, slots=True)\nclass Layer:\n    source: str\n    patches: tuple[Patch, ...] = ()"
+    - "@dataclass(frozen=True, slots=True)\nclass Resolution:\n    entries: tuple[Entry, ...]\n    provenance: Mapping[tuple[str, str], str]   # (dotted path, field) -> layer"
+    - "def resolve(base: Sequence[Entry], layers: Sequence[Layer], /) -> Resolution"
+    - "def read_layer(raw: object, source: str, /) -> Layer   # one patch document, validated in full"
+    - "def wrote(resolution: Resolution, source: str, /) -> tuple[tuple[str, str], ...]   # what one layer accounts for"
+    - "# cordis.errors, amended\nclass PatchTargetError(CordisError, ValueError):\n    patch_id, layer_source, target, reason"
+  idioms:
+    - >-
+      `resolve` is a pure function over frozen dataclasses with no IO, which
+      makes the whole layering system testable without a filesystem and makes
+      the property below cheap.
+    - >-
+      Provenance is accumulated during the fold rather than reconstructed, so
+      `--dump-config --provenance` is free and cannot disagree with the actual
+      resolution.
+    - >-
+      The CLI's `--dump-config` calls exactly this function; there is no second
+      implementation of the merge for printing.
+  typing_notes:
+    - >-
+      `Resolution.provenance` is keyed by (entry_id, field_name) so it renders
+      as a table without post-processing.
+    - >-
+      `Patch.fields` and `Resolution.provenance` default to one shared empty
+      `MappingProxyType`, but through `field(default_factory=...)` rather than a
+      plain `=`. Python 3.11's `dataclasses` classifies a `mappingproxy` as a
+      mutable default and refuses the class at definition time; 3.12 allows it.
+      The port supports 3.11, so the factory is not a style choice — a bare
+      default makes `import cordis` raise `ValueError` on the minimum
+      interpreter. The factory returns the same shared proxy, so the immutable
+      default is still allocated once for the whole process.
+  concurrency:
+    - "Pure and synchronous; no concurrency concerns."
+  deviations:
+    - >-
+      The module is `cordis.layering`, not `cordis.loader.layering`:
+      `cordis.loader` is a module rather than a package, and the dependency
+      runs one way — layering imports the loader's `Entry` and its reader, the
+      loader knows nothing about layers. Folding layers and mounting the result
+      stay separable, which is what makes `--dump-config` possible without a
+      host.
+    - >-
+      A patch targets the dotted path (`group.child`), not a bare id. A bare id
+      is not unique across groups, and the loader already identifies a nested
+      entry by its path everywhere else it can fail; two spellings of "which
+      entry" would be one spelling too many.
+    - >-
+      `PatchTargetError` gains a fourth field, `reason`, and becomes the single
+      error for every way a patch can fail to apply: no such target (SEM-004),
+      a name that does not match (SEM-005), an insert into something that is
+      not a group (SEM-003), and an insert whose id the target already defines.
+      All four name the patch, its layer and the entry, which is what makes any
+      of them a five-minute investigation; splitting them across four classes
+      would let a caller catch three of them and miss the fourth.
+    - >-
+      An insert whose id already exists in its target is an error, though no
+      rule asks for it. Two rows with one path would make every later patch
+      that targets it ambiguous and would collide in the provenance table — the
+      capability's own artefact would stop being readable.
+    - >-
+      `Patch` rejects at construction rather than at resolution: `fields`
+      without an `id`, `id` among `fields`, and `group` among `fields`.
+      Rewriting an id would rekey the entry every later layer targets, and
+      `group` is what `insert` is for. A patch that cannot be built is one
+      fewer branch in the fold.
+    - >-
+      Provenance covers every field of every entry, seeded from `BASE`, and
+      records a write whether or not the value changed. SEM-007's neutrality is
+      about the entry list — which is what the loader diffs and what decides
+      whether anything remounts — while a layer that restated a value did write
+      it, and a table that hid that would name the wrong party to talk to.
+    - >-
+      `read_layer` is added to the surface. The capability exists because
+      separate parties ship separate files, and `resolve` stays a pure function
+      over validated entries only if reading a patch document is somebody
+      else's job. It validates a patch's `fields` by handing them to the
+      loader's own row reader as a synthetic row, so a config expression, an
+      isolation map or an inject list means in a patch exactly what it means in
+      an entry, with no second implementation to drift.
+    - >-
+      `resolve` preserves the identity of every entry no layer touched: only
+      the path from the root to a patched entry is rebuilt. Not required by any
+      rule, but it makes SEM-007 observable with `is` rather than `==`, which
+      is the form of the question the loader's own diff asks.
+
+properties:
+
+  - id: PROP-LAYER-001
+    claim: >-
+      Resolution is a pure function: the same base and layers always produce an
+      equal resolution, and neither input is mutated.
+    shape: idempotency
+    evidence: [SEM-001]
+    domain:
+      generates: A base entry list and 0-6 layers of generated patches over the ids present.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Two resolutions of the same inputs are equal, and both inputs deep-equal
+        pre-taken copies.
+      independence: "Copies are taken with copy.deepcopy before the first call."
+    failure_value: >-
+      A fold that mutates the base entry objects in place, so the second
+      reconcile of the same file sees a base already carrying the first run's
+      patches and the layers apply twice.
+    test_tier: local
+    status: passing
+    test_id: tests/test_layering.py::test_resolution_is_a_pure_function_of_its_inputs
+
+  - id: PROP-LAYER-002
+    claim: >-
+      For every entry field in the resolution, its value equals the value
+      written by the last layer that wrote it, and the recorded provenance
+      names that layer.
+    shape: differential
+    evidence: [SEM-002, SEM-006]
+    domain:
+      generates: >-
+        Layers whose patches deliberately overlap on the same (id, field)
+        pairs, drawn from a small alphabet of ids and fields so overlap is
+        frequent.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        A last-write-wins dict maintained by the test while walking the
+        generated layers in order.
+      independence: >-
+        A few lines of dict assignment over the generated plan, sharing no code
+        with the fold.
+    failure_value: >-
+      Applying layers in reverse so a user's machine-level preference is
+      overridden by the vendor bundle it was meant to override — a bug that
+      looks like "my setting is ignored" and is otherwise very hard to localise.
+    test_tier: local
+    status: passing
+    test_id: tests/test_layering.py::test_every_field_holds_what_the_last_layer_to_write_it_wrote
+
+  - id: PROP-LAYER-003
+    claim: >-
+      Adding a layer with no patches, or a layer whose patches restate values
+      already present, leaves the resolution equal.
+    shape: idempotency
+    evidence: [SEM-007]
+    domain:
+      generates: A base and layers, plus a generated no-op layer inserted at a generated position.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: "Resolutions with and without the no-op layer are equal in entries."
+      independence: >-
+        Compares two runs whose inputs differ only by a construction the
+        specification defines as neutral.
+    failure_value: >-
+      A patch that restates a value being recorded as a change and remounting
+      that entry, so adding an empty profile file restarts plugins.
+    test_tier: local
+    status: passing
+    test_id: tests/test_layering.py::test_a_layer_that_restates_what_is_already_there_changes_nothing
+
+  - id: PROP-LAYER-004
+    claim: >-
+      A patch whose id is absent, or whose expected name mismatches, fails
+      naming the id and the layer, and produces no partial resolution.
+    shape: safety
+    evidence: [SEM-004, SEM-005]
+    domain:
+      generates: Layers containing a generated number of patches targeting absent ids or mismatched names, interleaved with valid patches.
+    preconditions:
+      - At least one patch is invalid; guaranteed by construction.
+    oracle:
+      kind: invariant
+      description: >-
+        The raised error names the first offending patch's id and its layer
+        source, and no Resolution object is returned.
+      independence: "The offending set is the generator's own construction."
+    failure_value: >-
+      Renaming an entry id in a vendor bundle silently discarding every
+      downstream patch that targeted it, so a deployment loses its
+      customisations at upgrade time with no message.
+    test_tier: local
+    status: passing
+    test_id: tests/test_layering.py::test_a_patch_that_cannot_apply_names_itself_its_layer_and_its_target
+
+  - id: PROP-LAYER-005
+    claim: >-
+      Insert patches place entries exactly where specified and never reorder or
+      duplicate existing entries.
+    shape: conservation
+    evidence: [SEM-003]
+    domain:
+      generates: A base list with groups, plus insert patches targeting the root and generated group ids.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The expected list is computed by the test appending each insert to the
+        named target in layer order; the multiset of pre-existing entry ids
+        must be preserved exactly.
+      independence: "Computed by list append over the generated plan."
+    failure_value: >-
+      An insert targeting a group whose config is not yet a list replacing that
+      config instead of appending, silently deleting every row of the group it
+      was extending.
+    test_tier: local
+    status: passing
+    test_id: tests/test_layering.py::test_inserts_append_where_named_and_move_nothing
+
+open_questions:
+  - >-
+    Whether a patch should be able to remove an entry outright, as opposed to
+    setting `disabled: true`. Removal loses the id, which breaks any later
+    layer that targets it — and under SEM-004 that later layer would then fail,
+    which is arguably correct but makes layer order even more load-bearing.

@@ -1,0 +1,409 @@
+$schema: "../schema/capability.v1.yaml"
+schema_version: capability/v1
+
+id: service-registry
+title: Service registry — named capabilities with owned lifetime
+status: implemented
+tier: 0
+summary: >-
+  A registry mapping (name, realm) to a live implementation, where providing is
+  an effect owned by the provider's scope, so a provider's teardown removes the
+  service and notifies everyone resolving it.
+
+problem:
+  statement: >-
+    Consumers must be able to reach a capability without importing its
+    implementation, and the set of available capabilities must be able to
+    change while the process runs, without any consumer holding a stale
+    reference.
+  without_this:
+    - Consumers import providers directly, so swapping a local shell for a
+      remote sandbox means editing every consumer.
+    - A capability's availability is decided at import time, so it cannot be
+      selected by configuration or removed at runtime.
+    - Nothing observes provider removal, so consumers keep calling into an
+      object whose resources were already released.
+  rejected_alternatives:
+    - option: A module-level singleton registry dict.
+      why_rejected: >-
+        No lifetime owner, no per-subtree override, and test isolation requires
+        monkeypatching global state.
+    - option: Constructor injection wired by a DI container at startup.
+      why_rejected: >-
+        Assumes the object graph is built once. Cordis's value is that the
+        graph is edited while running; a startup-time container cannot express
+        provider replacement.
+
+origin:
+  references:
+    - repo: cordis
+      path: packages/core/src/reflect.ts
+      symbol: "ReflectService.provide, notify, accessor, mixin"
+    - repo: cordis
+      path: packages/core/src/service.ts
+      symbol: "Service, Service.init, Service.check"
+    - repo: kb-docs
+      path: modular-software/cordis-cheatsheet.md
+      symbol: "§2.4 Service"
+
+depends_on: [context-tree, effect-scope]
+
+semantics:
+  - id: SEM-001
+    kind: MUST
+    rule: >-
+      `registry.provide(name, value, scope=...)` records the binding and
+      returns a disposer; the binding is registered as an effect on the given
+      scope, so the provider's teardown removes it.
+    rationale: >-
+      Ties availability to the provider's lifetime with no separate bookkeeping
+      the author can forget.
+
+  - id: SEM-002
+    kind: MUST
+    rule: >-
+      Resolving a name from a context returns the implementation bound in the
+      nearest enclosing realm for that name; if none exists, resolution raises
+      `ServiceNotFoundError` naming the service and the realm searched.
+    rationale: Same reason as context resolution — absence must be loud.
+
+  - id: SEM-003
+    kind: MUST-NOT
+    rule: >-
+      Two live bindings MUST NOT exist for the same (name, realm) pair;
+      a second `provide` raises `ServiceConflictError` and leaves the first
+      binding intact and callable.
+    rationale: >-
+      Silent last-write-wins makes provider selection order-dependent, which is
+      exactly the property the loader deliberately does not guarantee.
+
+  - id: SEM-004
+    kind: MUST
+    rule: >-
+      Every transition of the binding set (added, removed, replaced) emits a
+      notification identifying the name and realm, before any dependent
+      re-evaluation runs.
+    rationale: >-
+      Dependency tracking is built on this notification; if it fires late,
+      consumers observe a window where a removed service still resolves.
+
+  - id: SEM-005
+    kind: MUST
+    rule: >-
+      A binding whose provider declares a readiness gate is not observable to
+      resolvers until that gate completes; a gate that raises fails the
+      provider and never publishes the binding.
+    rationale: >-
+      Mirrors upstream `Service.init`, which blocks dependents. Publishing a
+      half-initialised service is the subtlest class of startup bug.
+
+  - id: SEM-006
+    kind: MUST
+    rule: >-
+      Disposing a binding is atomic with respect to resolution: no resolver
+      observes a state in which the name is present but the value has been torn
+      down.
+    rationale: >-
+      Teardown and lookup interleave freely in an async runtime; the registry
+      is the only place this can be made safe.
+
+  - id: SEM-007
+    kind: MUST
+    rule: >-
+      `Service` subclasses declare their registry name as a class attribute and
+      are resolvable both by that name and by the class object itself.
+    rationale: >-
+      The name is the configuration-facing identity; the class is the
+      type-checkable identity. Both must reach the same binding.
+    deviation:
+      upstream: >-
+        Upstream reaches typed access through TypeScript declaration merging on
+        the `Context` interface.
+      rationale: >-
+        Python has no declaration merging. Keying by the class gives mypy the
+        same static guarantee without a parallel type-only namespace.
+
+python_design:
+  module: cordis.registry
+  surface:
+    - "class ServiceRegistry:"
+    - "    def provide(self, name: str, value: object, *, scope: EffectScope, realm: Realm = ..., gate: Gate | None = None) -> EffectHandle: ..."
+    - "    def resolve(self, token: type[T] | str, *, ctx: Context) -> T: ..."
+    - "    def lookup(self, token: type[T] | str, *, ctx: Context) -> T | None: ..."
+    - "    def bindings(self) -> Mapping[tuple[str, Realm], BindingInfo]: ..."
+    - "class Service:"
+    - "    name: ClassVar[str]"
+    - "    def __init__(self, ctx: Context) -> None: ..."
+    - "    async def __aenter__(self) -> Self: ..."
+    - "@dataclass(frozen=True, slots=True)\nclass BindingChange:\n    name: str\n    kind: ChangeKind\n    realm: Realm"
+    - "class RegistryConflictError(CordisError, RuntimeError): name, holder"
+    - "class ServiceConflictError(CordisError, RuntimeError): name, holder"
+    - "class ServiceNotFoundError(CordisError, LookupError): name"
+  idioms:
+    - >-
+      `Service.__init_subclass__` validates that `name` is set and registers
+      the class -> name mapping, so the two halves that upstream keeps in sync
+      by convention are checked at class-creation time.
+    - >-
+      Readiness gates are `async def` methods or async generators, so a service
+      that must both initialise and clean up writes one async generator instead
+      of a pair of hooks.
+    - >-
+      `bindings()` returns a read-only mapping view, not the live dict.
+    - >-
+      `provide` returns the `EffectHandle` from the registration rather than a
+      bare disposer: the handle *is* a disposer (calling it unbinds) and is
+      also awaitable, which is how a caller waits for a gated provider to
+      become ready. Two names for one registration would be two things to keep
+      in step.
+    - >-
+      A context's realm is scoped metadata under a dunder key, not a field on
+      Context — realm membership is inherited exactly the way every other
+      scoped value is, instead of by a second, parallel rule.
+  typing_notes:
+    - >-
+      `resolve` is overloaded: `resolve(cls: type[T]) -> T` for the typed path
+      and `resolve(name: str) -> Any` for the dynamic path, so passing a class
+      never degrades to Any.
+  concurrency:
+    - >-
+      Mutations are performed inside a single synchronous critical section;
+      awaits (gates) happen strictly before or after it, never inside, which is
+      what makes SEM-006 achievable without a lock.
+  deviations:
+    - >-
+      Amended by service-isolation: a context's realm is per *name* before it
+      is per context. `realm_for(ctx, name)` reads the nearest `__realm__:name`
+      key, then the nearest `__realm__`, then `DEFAULT_REALM`, and `lookup`,
+      `resolve` and `provide` all go through it. `realm_of(ctx)` keeps its
+      meaning -- the realm for names nothing has isolated -- and every rule in
+      this record still holds with "realm" read as "the realm for this name".
+    - >-
+      Amended by service-isolation: `provide` accepts `ctx=` alongside `realm=`
+      and derives the binding realm with the same `realm_for` that lookup uses.
+      A provider binding where its own context cannot resolve it would satisfy
+      every property card in this record and still be wrong.
+    - >-
+      Amended by service-interception: `service_name(token, *, subject=None)`
+      and `token_label(token)` move here, and `inject` and `realm` call them.
+      "What is this token called" is a question about the registry's identity
+      rule (SEM-007), and it had grown a private answer in each module that
+      asked it; a fourth copy for interception would have made it a question
+      with four answers. The consolidated one raises `InvalidPluginError`,
+      which is a `TypeError`, so no caller's `except` clause changes meaning.
+    - >-
+      Amended by capability-seam: `Service.__init_subclass__` accepts a class
+      keyword, `class D(Service, abstract=True)`, which skips the non-empty
+      `name` check. SEM-007's rule is about classes that stand for a binding,
+      and an abstract Definition stands for none -- it exists so Providers and
+      Consumers have one artefact to import. The escape is opt-in and, being a
+      class keyword rather than an attribute, is not inherited: a Provider
+      subclassing an abstract Definition is checked exactly as before, so no
+      concrete Service can reach a binding without a declared name.
+
+properties:
+
+  - id: PROP-REG-001
+    claim: >-
+      For any sequence of provide and dispose operations, the registry's
+      binding set equals the set computed by a plain-dict model of the same
+      operations.
+    shape: differential
+    evidence: [SEM-001, SEM-002, SEM-003]
+    domain:
+      generates: >-
+        A sequence of 0-40 operations over a small alphabet of service names
+        and realms: provide, dispose-existing, dispose-already-disposed.
+      excludes:
+        - Gated providers; covered by PROP-REG-004.
+      strategy_hint: >-
+        Generate operations against a running model so only meaningful
+        dispose targets are chosen, instead of generating blind and discarding.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        A dict keyed by (name, realm) maintained by the test, with conflicting
+        provides expected to raise and to leave the model unchanged.
+      independence: >-
+        The model is ten lines of dict manipulation written from the semantics,
+        not from the implementation; it shares no code with the registry.
+    failure_value: >-
+      A registry keyed by name alone, so a provider in an isolated realm
+      collides with — and evicts — the binding of the same name in the
+      enclosing realm.
+    notes: >-
+      Amended after implementation. The original failure_value was "a disposer
+      that removes the key unconditionally rather than only when it still
+      points at its own binding". That guard exists in the implementation, but
+      the defect is unreachable through the public surface: disposal goes
+      through the EffectHandle, whose idempotence (effect-scope PROP-EFFECT-003)
+      means a stale disposer never runs a second time, so no generated program
+      can reach the state the guard protects. Mutation testing found the card
+      unfalsifiable and it was restated around a defect this program does
+      catch. The identity check stays as depth-in-defence, and the layer below
+      is where the original defect is now tested.
+    test_tier: local
+    status: passing
+    test_id: tests/test_registry.py::test_the_binding_set_matches_a_plain_dict_model
+
+  - id: PROP-REG-002
+    claim: >-
+      After disposing the scope that provided a service, resolving that service
+      raises ServiceNotFoundError rather than returning the torn-down value.
+    shape: safety
+    evidence: [SEM-001, SEM-006]
+    domain:
+      generates: A set of providers on nested scopes plus a generated dispose order over those scopes.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        For each disposed scope, every name it provided must raise on
+        resolution, and every name provided by still-live scopes must resolve
+        to its original object.
+      independence: >-
+        The expected live set is computed from the test's own record of which
+        scopes were disposed, not from the registry's binding view.
+    failure_value: >-
+      Holding the provider in a module-level cache for speed, so resolution
+      keeps returning an object whose connections were already closed — a
+      "connection already closed" error surfacing in an unrelated plugin.
+    test_tier: local
+    status: passing
+    test_id: tests/test_registry.py::test_a_disposed_provider_stops_resolving
+
+  - id: PROP-REG-003
+    claim: >-
+      A provide that raises ServiceConflictError leaves the pre-existing
+      binding resolvable and unchanged.
+    shape: safety
+    evidence: [SEM-003]
+    domain:
+      generates: An initial set of bindings plus a conflicting provide for a randomly chosen existing (name, realm).
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        Resolution after the failed provide returns the identical object
+        (`is`) that was bound before it, and the binding count is unchanged.
+      independence: >-
+        Identity comparison against an object captured before the operation
+        cannot be satisfied by any recomputation the implementation performs.
+    failure_value: >-
+      Writing the new binding and then checking for conflict, so a rejected
+      duplicate provider has already clobbered the incumbent by the time the
+      error is raised.
+    test_tier: local
+    status: passing
+    test_id: tests/test_registry.py::test_a_rejected_provider_leaves_the_incumbent_intact
+
+  - id: PROP-REG-004
+    claim: >-
+      A gated service is never resolvable before its gate completes, and is
+      never resolvable at all if its gate raises.
+    shape: safety
+    evidence: [SEM-005]
+    domain:
+      generates: >-
+        Providers with gates that complete after a generated number of event
+        loop turns, a generated subset of which raise.
+    preconditions: []
+    oracle:
+      kind: invariant
+      description: >-
+        A resolver task polls each turn and records the first turn at which the
+        name resolved; that turn must be >= the gate's completion turn, and
+        must never occur for gates that raise.
+      independence: >-
+        The gate's completion turn is decided by the generator before the run;
+        the observation is made by a separate task, so both sides are outside
+        the registry's control.
+    failure_value: >-
+      Publishing the binding before awaiting the gate, so a consumer that
+      started concurrently calls a service whose connection pool is still None.
+    test_tier: pr
+    status: passing
+    test_id: tests/test_registry.py::test_a_gated_service_is_invisible_until_its_gate_completes
+
+  - id: PROP-REG-005
+    claim: >-
+      Resolving by a Service subclass and resolving by that class's declared
+      name return the identical object, for every provided service.
+    shape: metamorphic
+    evidence: [SEM-007]
+    domain:
+      generates: A set of dynamically created Service subclasses with generated valid names, provided in generated order.
+    preconditions: []
+    oracle:
+      kind: metamorphic
+      description: >-
+        `registry.resolve(cls, ctx=c) is registry.resolve(cls.name, ctx=c)` for
+        every provided class and every context in the tree.
+      independence: >-
+        The two lookups traverse different key types through different
+        overloads; agreement is a real constraint on the implementation's key
+        normalisation.
+    failure_value: >-
+      A class-keyed fast path that caches by class identity and so misses a
+      rebinding performed under the string name by the loader, splitting the
+      registry into two disagreeing views.
+    test_tier: local
+    status: passing
+    test_id: tests/test_registry.py::test_class_and_name_lookups_reach_the_same_binding
+
+  - id: PROP-REG-006
+    claim: >-
+      Every binding-set transition emits exactly one notification naming the
+      changed service, and no notification is emitted when an operation leaves
+      the binding set unchanged.
+    shape: conservation
+    evidence: [SEM-004]
+    domain:
+      generates: >-
+        An operation sequence including no-ops (disposing an already-disposed
+        binding, providing a conflicting name) interleaved with real changes.
+    preconditions: []
+    oracle:
+      kind: model
+      description: >-
+        The model dict from PROP-REG-001 yields the expected change list by
+        diffing its own key set after each operation; compare to the captured
+        notification log.
+      independence: >-
+        The expected change list is derived from state snapshots, while the
+        notifications come from the implementation's emission points — a
+        forgotten emit or a spurious one breaks the equality.
+    failure_value: >-
+      A notification emitted for a rejected conflicting provide, telling every
+      dependent to re-evaluate a binding that never changed — an unload storm
+      caused by an operation that did nothing.
+    notes: >-
+      Amended after implementation, for the same reason as PROP-REG-001: the
+      original failure_value (a spurious notification on a no-op dispose) is
+      unreachable because the EffectHandle absorbs the second dispose before
+      the registry sees it. The rejected-provide case is the reachable member
+      of the same class — an operation that leaves the binding set unchanged
+      and must therefore announce nothing.
+    test_tier: local
+    status: passing
+    test_id: tests/test_registry.py::test_every_binding_change_emits_exactly_one_notification
+
+open_questions:
+  - >-
+    DEFERRED: `Service.__aenter__`, listed in the surface above, is not
+    implemented here. A service's lifecycle belongs to the fiber that mounts
+    it; implementing half of it in the registry would create a second place
+    that decides when a service is ready, which SEM-005 already assigns to the
+    gate. Revisit under plugin-mounting.
+  - >-
+    RESOLVED (implementation): a listener that raises fails the operation that
+    caused the change. For a provide, the binding is withdrawn silently and the
+    error is raised, so the registry is never in a state some observers were
+    never told about. Alternatives considered and rejected: swallowing (hides
+    broken observers) and rolling forward (leaves the binding set and the
+    notification log disagreeing).
+  - >-
+    Whether resolution should be memoised per context. It would help hot paths
+    but every memo is a place SEM-006 can be violated; deferred until a
+    benchmark shows the walk is actually hot.
