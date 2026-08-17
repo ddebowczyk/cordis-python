@@ -210,16 +210,35 @@ Property cards drive the code. For each capability: transcribe its cards into
 Hypothesis tests using the declared domain and oracle, watch them fail, then
 implement. A card's `failure_value` names the defect the test exists to catch —
 if the test still passes once that defect is deliberately introduced, the test is
-wrong, not the implementation.
+wrong, not the implementation. That last step is not left to good intentions:
+`ops/test/mutations.yaml` declares those defects, and `just ops test mutate all`
+introduces each one and requires the suite to go red.
+
+Repository operations live in [`ops/`](ops/README.md), one directory per
+capability, each owning its own scripts, schemas, docs and `justfile`. The root
+`justfile` defines nothing itself — it delegates:
+
+```
+just ops <capability> <command>    # anything a capability declares
+just list                          # every capability and its commands
+just validate                      # the manifests describe the repository
+```
+
+The common ones have aliases:
 
 ```
 just sync            # uv-managed dev environment
-just check           # ruff + mypy --strict
+just check           # the fast lane: lint, types, YAML, specs, manifests
 just test            # local-tier property tests
 just test-nightly    # longer campaigns
 just docs            # regenerate docs/reference.md from code + records
 just ci              # everything CI runs, in CI's order
+just doctor          # the tools the manifests require, and whether you have them
 ```
+
+`check` and `test` are not lists kept somewhere: a command joins a lane by
+declaring `aggregate: check` or `aggregate: test` in its own capability manifest,
+and `ops/bin/ops.py` collects them.
 
 The plan lives in [beads](https://github.com/steveyegge/beads): `bd ready` gives
 the next unblocked task, and the dependency graph is generated from the specs'

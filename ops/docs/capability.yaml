@@ -1,0 +1,48 @@
+$schema: ../capabilities/schema/capability.v1.yaml
+schema_version: ops-capability/v1
+
+id: docs
+provides: documentation
+description: >-
+  Generate the API reference from the code, and check that every claim the
+  documentation makes about the library is still true.
+status: supported
+
+requires:
+  tools: [uv]
+  capabilities: []
+
+owns:
+  - ops/docs/**
+
+reads:
+  - docs/build_reference.py
+  - src/**
+  - spec/capabilities/**
+  - README.md
+  - CHANGELOG.md
+  - tests/test_readme.py
+
+generates:
+  - docs/reference.md
+
+commands:
+  - name: build
+    summary: Regenerate the reference from the docstrings and the catalog.
+    lane: fast
+  - name: check
+    summary: Fail if the checked-in reference no longer matches the code.
+    lane: fast
+    aggregate: check
+  - name: counters
+    summary: Check the counts the README and CHANGELOG claim against the catalog.
+    lane: fast
+    aggregate: check
+  - name: readme
+    summary: Run the README's quickstart the way a reader would.
+    lane: fast
+  - name: all
+    summary: Every documentation check, in the order a release wants them.
+    lane: fast
+
+skills: []

@@ -9,6 +9,7 @@ A handle that reports "disposed" while leaking any of the three still fails.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import sys
 import weakref
 from dataclasses import dataclass, field
@@ -234,6 +235,40 @@ async def test_disposal_runs_strictly_bottom_up(spec: TreeSpec) -> None:
             assert position[label] < first_ancestor_effect, (
                 f"{label} unwound after an effect of its ancestor {node.label} "
                 f"at {path}"
+            )
+
+
+@pytest.mark.tier_local
+@given(spec=gen.tree_specs(max_children=3, max_leaves=8))
+async def test_siblings_unwind_newest_first(spec: TreeSpec) -> None:
+    """SEM-004 says *reverse* mount order, which bottom-up alone does not say.
+
+    Failure value: iterating a parent's children forward, so the plugin it
+    mounted first -- the one its later siblings were written against, because
+    it was there when they loaded -- is torn down while they are still using
+    it. Every descendant still precedes every ancestor, so PROP-PLUGIN-003 is
+    satisfied by this defect.
+    """
+    world = World()
+    await world.ctx.plugin(contributor(world, spec.label, children=spec.children))
+    await world.root.dispose()
+
+    position = {label: index for index, label in enumerate(world.unwound)}
+
+    def subtree(node: TreeSpec) -> set[str]:
+        return {node.label, f"{node.label}!"}.union(
+            *(subtree(child) for child in node.children), set()
+        )
+
+    # A child is disposed whole before the next one starts, so the later
+    # sibling's entire subtree comes before any of the earlier sibling's.
+    for _path, node in spec.walk():
+        for earlier, later in itertools.pairwise(node.children):
+            latest = max(position[label] for label in subtree(later))
+            earliest = min(position[label] for label in subtree(earlier))
+            assert latest < earliest, (
+                f"{earlier.label} was mounted before {later.label} but unwound "
+                f"before it finished"
             )
 
 

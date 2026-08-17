@@ -1,0 +1,32 @@
+$schema: ../capabilities/schema/capability.v1.yaml
+schema_version: ops-capability/v1
+
+id: spec
+provides: specification
+description: >-
+  Validate the library's capability catalog -- the contract the implementation
+  is held to -- per file and across files.
+status: supported
+
+requires:
+  tools: [uv, uvx, yq]
+  capabilities: []
+
+owns:
+  - ops/spec/**
+
+reads:
+  - spec/**
+
+generates: []
+
+commands:
+  - name: check
+    summary: Per-file schema, then reference resolution, tier ordering and rule coverage.
+    lane: fast
+    aggregate: check
+  - name: table
+    summary: Print the catalog as a build-order table.
+    lane: fast
+
+skills: []

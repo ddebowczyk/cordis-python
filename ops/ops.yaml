@@ -1,0 +1,16 @@
+$schema: capabilities/schema/ops.v1.yaml
+schema_version: ops/v1
+
+# One provider per interface. Nothing reads this at runtime: it exists so the
+# choice is written down, and so `just ops control validate` can check that
+# every interface names a capability that exists and agrees it provides it.
+active:
+  operations-control: control
+  quality: quality
+  test: test
+  specification: spec
+  documentation: docs
+  version: version
+  package-integrity: packaging
+  distribution: release
+  local-delivery: workflow

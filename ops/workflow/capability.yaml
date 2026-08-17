@@ -1,0 +1,41 @@
+$schema: ../capabilities/schema/capability.v1.yaml
+schema_version: ops-capability/v1
+
+id: workflow
+provides: local-delivery
+description: >-
+  Check that the local toolchain can run the operations the manifests declare,
+  and keep one description of CI that both the local runner and GitHub follow.
+status: supported
+
+requires:
+  tools: [git, just, uv]
+  capabilities: [control]
+
+owns:
+  - ops/workflow/**
+  - .github/workflows/**
+  - justfile
+
+reads:
+  - ops/*/capability.yaml
+  - pyproject.toml
+
+generates: []
+
+commands:
+  - name: doctor
+    summary: Every tool the manifests require, and whether this machine has it.
+    lane: fast
+  - name: sync
+    summary: Install or refresh the development environment.
+    lane: slow
+  - name: ci
+    summary: What CI runs, in CI's order, on this machine.
+    lane: slow
+  - name: ci-check
+    summary: Fail if the workflow files and the local CI lane have drifted apart.
+    lane: fast
+    aggregate: check
+
+skills: []

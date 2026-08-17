@@ -1,0 +1,22 @@
+# Lint and types. The settings live in `pyproject.toml`, where the tools look
+# for them; this capability owns when they run, not what they say.
+
+lint:
+    uv run ruff check .
+    uv run ruff format --check .
+
+types:
+    uv run mypy
+
+# YAML is a first-class source language here -- capability manifests, the
+# schemas themselves, the workflows -- so it is linted like one. Settings live
+# in `.yamllint.yaml`; `uvx` rather than a system install so CI and a laptop
+# run the same version.
+yaml:
+    uvx yamllint --strict .
+
+fix:
+    uv run ruff check --fix .
+    uv run ruff format .
+
+all: lint yaml types

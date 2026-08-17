@@ -261,6 +261,36 @@ async def test_a_failed_setup_releases_only_its_own_resources(
     assert ledger.balanced
 
 
+@pytest.mark.tier_local
+@given(yielded=st.integers(min_value=2, max_value=6))
+async def test_a_failed_setup_unwinds_its_own_resources_in_reverse(
+    yielded: int,
+) -> None:
+    """Rollback is a disposal, so PROP-EFFECT-002's order governs it too.
+
+    Failure value: rolling a half-built effect forward instead of in reverse,
+    releasing the connection it opened first while the cursor opened on top of
+    that connection is still the thing being released.
+    """
+    ledger = ResourceLedger()
+    scope = EffectScope("root")
+
+    def failing() -> Iterator[Callable[[], object]]:
+        for index in range(yielded):
+            yield ledger.disposer(f"partial{index}")
+        raise MarkerError(99)
+
+    with pytest.raises(MarkerError):
+        scope.effect(failing, label="failing")
+
+    # Compared against the sequence this test issued, not against anything the
+    # scope recorded: a rollback that drops a disposer fails here as well.
+    ledger.assert_unwound([f"partial{index}" for index in range(yielded)])
+
+    await scope.dispose()
+    assert ledger.balanced
+
+
 # --------------------------------------------------------------------------
 # PROP-EFFECT-005
 # --------------------------------------------------------------------------

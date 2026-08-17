@@ -1,0 +1,27 @@
+# Release management. `publish` is the only recipe here that changes anything
+# outside the checkout, and it refuses to run unless `status` is clean.
+
+status:
+    uv run ops/release/bin/release.py status
+
+notes version:
+    uv run ops/release/bin/release.py notes {{ version }}
+
+# Every gate the tag claims passed. Kept here rather than in CI's copy so a
+# release can be rehearsed locally before the tag exists.
+gate:
+    @just --justfile ops/spec/justfile --working-directory . check
+    @just --justfile ops/quality/justfile --working-directory . all
+    @just --justfile ops/docs/justfile --working-directory . all
+    @just --justfile ops/version/justfile --working-directory . check
+    @just --justfile ops/test/justfile --working-directory . release
+    @just --justfile ops/packaging/justfile --working-directory . all
+
+# Prints its plan and stops. `just ops release publish --confirm` is what
+# actually creates the tag and the release; a tag is not a thing to make by
+# typo, and this is the only command in ops/ that reaches outside the checkout.
+publish confirm="":
+    uv run ops/release/bin/release.py publish {{ confirm }}
+
+verify:
+    uv run ops/release/bin/release.py verify

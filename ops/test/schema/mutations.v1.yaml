@@ -1,0 +1,77 @@
+# Schema for ops/test/mutations.yaml -- the declared mutation campaigns.
+#
+# JSON Schema 2020-12, written in YAML and validated with `check-jsonschema`,
+# the same tool and the same way as the capability catalog under `spec/`.
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://github.com/ddebowczyk/cordis-python/ops/test/schema/mutations.v1.yaml
+title: Mutation campaigns
+description: >-
+  Deliberate defects, grouped into campaigns, that the test suite is required
+  to catch. Every field is required: an under-specified mutation is one that
+  can pass by doing nothing.
+
+type: object
+additionalProperties: false
+required: [schema_version, campaigns]
+
+properties:
+  $schema:
+    type: string
+  schema_version:
+    const: ops-mutations/v1
+  campaigns:
+    type: array
+    minItems: 1
+    items:
+      type: object
+      additionalProperties: false
+      required: [name, summary, mutations]
+      properties:
+        name:
+          type: string
+          pattern: ^[a-z][a-z0-9-]*$
+          description: How the campaign is named on the command line.
+        summary:
+          type: string
+          minLength: 20
+          description: What class of defect this campaign is about.
+        mutations:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: false
+            required: [title, test, edits]
+            properties:
+              title:
+                type: string
+                minLength: 10
+                description: The defect, stated as the bug it would be.
+              test:
+                type: string
+                description: >-
+                  The pytest selector that must fail once the edits are
+                  applied. Narrow it to the tests that are supposed to notice,
+                  so a survivor names the suite that has the hole.
+              edits:
+                type: array
+                minItems: 1
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [file, before, after]
+                  properties:
+                    file:
+                      type: string
+                      pattern: ^[^/].*$
+                      description: Repository-relative path to edit.
+                    before:
+                      type: string
+                      minLength: 1
+                      description: >-
+                        Text that must occur exactly once in the file. The
+                        harness refuses to run when it does not, so a refactor
+                        cannot silently turn a mutation into a no-op.
+                    after:
+                      type: string
+                      description: What replaces it.

@@ -1,0 +1,48 @@
+$schema: ../capabilities/schema/capability.v1.yaml
+schema_version: ops-capability/v1
+
+id: quality
+provides: quality
+description: Lint, format and type-check the repository to the settings it declares.
+status: supported
+
+requires:
+  tools: [uv, uvx]
+  capabilities: []
+
+owns:
+  - ops/quality/**
+
+reads:
+  - pyproject.toml
+  - .yamllint.yaml
+  - src/**
+  - tests/**
+  - examples/**
+  - spec/**
+  - docs/**
+  - .github/**
+
+generates: []
+
+commands:
+  - name: lint
+    summary: Run ruff's rule sets and check formatting, changing nothing.
+    lane: fast
+    aggregate: check
+  - name: types
+    summary: Run mypy in strict mode over src, tests, examples and ops.
+    lane: fast
+    aggregate: check
+  - name: yaml
+    summary: Lint every YAML file for syntax and layout, workflows included.
+    lane: fast
+    aggregate: check
+  - name: fix
+    summary: Apply every safe ruff fix and reformat.
+    lane: fast
+  - name: all
+    summary: "The full gate: lint, yaml, then types."
+    lane: fast
+
+skills: []

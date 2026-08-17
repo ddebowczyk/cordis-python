@@ -1,0 +1,22 @@
+# The library's capability catalog. `spec/` itself is not owned here: it ships
+# in the sdist as part of the contract a downstream fork receives, so this
+# capability runs the checks and does not author what it checks.
+#
+# The schema is JSON Schema 2020-12 written in YAML, validated with
+# `check-jsonschema` so this recipe and CI run the same tool the same way.
+# `ys -f spec/schema/capability.v1.yaml <file>` checks a single file when that
+# is closer to hand.
+
+check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uvx check-jsonschema --schemafile spec/schema/capability.v1.yaml spec/capabilities/*.yaml
+    uv run spec/check_spec.py
+
+table:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    printf '%-24s %4s %5s %6s  %s\n' capability tier rules props depends_on
+    for f in spec/capabilities/*.yaml; do
+        yq -r '.id + "|" + (.tier|tostring) + "|" + (.semantics|length|tostring) + "|" + (.properties|length|tostring) + "|" + ((.depends_on // [])|join(","))' "$f"
+    done | awk -F'|' '{printf "%-24s %4s %5s %6s  %s\n",$1,$2,$3,$4,$5}'

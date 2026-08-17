@@ -1,0 +1,38 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://github.com/ddebowczyk/cordis-python/ops/capabilities/schema/ops.v1.yaml"
+title: Repository Operations Catalogue (v1)
+description: >-
+  Which capability provides each interface. One provider per interface, chosen
+  here rather than discovered by scanning, so swapping an implementation is an
+  edit to one line and the swap is visible in a diff.
+
+  This file selects; it does not dispatch. `just ops <capability> <command>`
+  addresses a capability by name, and nothing reads `active` at runtime -- it
+  exists so the choice is written down and can be validated: every interface
+  must name a capability that exists and that declares it provides that
+  interface.
+
+type: object
+additionalProperties: false
+required: [schema_version, active]
+
+properties:
+
+  $schema:
+    type: string
+
+  schema_version:
+    const: ops/v1
+
+  active:
+    description: >-
+      Interface name to providing capability id. Both sides are checked against
+      the manifests, so a rename that misses this file fails validation instead
+      of silently selecting nothing.
+    type: object
+    minProperties: 1
+    propertyNames:
+      pattern: ^[a-z][a-z0-9-]*$
+    additionalProperties:
+      type: string
+      pattern: ^[a-z][a-z0-9-]*$

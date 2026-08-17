@@ -1,0 +1,59 @@
+$schema: ../capabilities/schema/capability.v1.yaml
+schema_version: ops-capability/v1
+
+id: test
+provides: test
+description: >-
+  Run the property-test tiers, replay recorded failures, and verify that the
+  tests would catch the defects they claim to.
+status: supported
+
+requires:
+  tools: [uv, uvx]
+  capabilities: []
+
+owns:
+  - ops/test/**
+
+reads:
+  - pyproject.toml
+  - src/**
+  - tests/**
+  - examples/**
+  - spec/capabilities/**
+
+generates:
+  - .hypothesis/**
+
+commands:
+  - name: fast
+    summary: Local tier -- 50 examples, no nightly or release campaigns.
+    lane: fast
+    aggregate: test
+  - name: pr
+    summary: What a pull request runs -- 200 examples, everything but the release tier.
+    lane: slow
+  - name: nightly
+    summary: Longer campaigns -- 2000 examples, every marker.
+    lane: slow
+  - name: release
+    summary: Exhaustive -- 20000 examples, before a release or during an incident.
+    lane: slow
+  - name: replay
+    summary: Re-run one test against the recorded shrunk counterexamples.
+    lane: fast
+    args: [selector]
+  - name: discards
+    summary: Generator health, worst first -- read as a trend, not a filter rate.
+    lane: slow
+  - name: mutate
+    summary: Break the implementation on purpose and require the suite to notice.
+    lane: slow
+    args: [campaign]
+  - name: campaigns
+    summary: List the declared mutation campaigns.
+    lane: fast
+
+skills:
+  - name: mutation-verification
+    summary: Decide whether a test suite actually holds a capability, and act on a survivor.

@@ -1,0 +1,27 @@
+# Local delivery: the toolchain this repository needs, and the one description
+# of CI. `ci` and `.github/workflows/ci.yml` are two renderings of the same
+# list, and `ci-check` is what stops them drifting apart again.
+
+doctor:
+    uv run ops/workflow/bin/doctor.py
+
+sync:
+    uv sync --all-extras
+
+# The list. `.github/workflows/ci.yml` is the same list arranged into jobs,
+# and `ci-check` fails if the two stop agreeing. Nightly campaigns live in
+# `nightly.yml`, which is not part of this comparison: they are a different
+# question asked on a different schedule.
+ci:
+    @just --justfile ops/control/justfile --working-directory . validate
+    @just --justfile ops/control/justfile --working-directory . test
+    @just --justfile ops/workflow/justfile --working-directory . ci-check
+    @just --justfile ops/spec/justfile --working-directory . check
+    @just --justfile ops/quality/justfile --working-directory . all
+    @just --justfile ops/docs/justfile --working-directory . all
+    @just --justfile ops/packaging/justfile --working-directory . build
+    @just --justfile ops/packaging/justfile --working-directory . verify
+    @just --justfile ops/test/justfile --working-directory . pr
+
+ci-check:
+    uv run ops/workflow/bin/doctor.py --ci

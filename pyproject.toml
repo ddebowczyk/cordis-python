@@ -130,6 +130,10 @@ ignore = [
     "FBT003",
     "SLF001",
 ]
+# The validator's tests hand it wrong catalogues on purpose, which means
+# calling the individual checks by name. Those are private for callers, not for
+# the thing testing that each rule fires.
+"ops/*/tests/**" = ["SLF001"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "parents"
@@ -144,11 +148,12 @@ known-first-party = ["cordis"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src", "tests", "examples"]
+files = ["src", "tests", "examples", "ops"]
 # Strict means strict: no per-module relaxations. If a signature cannot be
 # expressed, that is a design signal, not a reason to loosen the gate. The
 # examples are held to it too: an example that only type-checks loosely is
-# advice a reader cannot follow.
+# advice a reader cannot follow, and the operations scripts are held to it
+# because they are what decides whether a release happens.
 warn_unreachable = true
 warn_unused_ignores = true
 enable_error_code = [

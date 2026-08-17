@@ -1,0 +1,31 @@
+# YAML linting. This answers a different question from schema validation:
+# `check-jsonschema` asks whether a document means the right thing, yamllint
+# asks whether it parses and reads consistently. Both are needed -- a manifest
+# with an unquoted colon in a summary is a syntax error no schema ever sees,
+# because the file never becomes a document to validate.
+#
+# Run with `just ops quality yaml`.
+
+extends: default
+
+rules:
+  # Capability records carry prose and code samples on single lines, and the
+  # source they quote has its own line budget. Wrapping them to satisfy a
+  # linter would make the quoted code wrong.
+  line-length: disable
+
+  # `---` adds nothing to a repository where every YAML file is one document.
+  document-start: disable
+
+  # GitHub Actions spells its trigger block `on:`, which YAML 1.1 reads as a
+  # boolean. The key is not ours to rename.
+  truthy:
+    check-keys: false
+
+  # `${{ matrix.python }}` is the expression syntax Actions requires; the
+  # spaces inside the braces are part of it.
+  braces:
+    max-spaces-inside: 1
+
+  comments:
+    min-spaces-from-content: 1

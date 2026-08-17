@@ -1,0 +1,51 @@
+$schema: ../capabilities/schema/capability.v1.yaml
+schema_version: ops-capability/v1
+
+id: version
+provides: version
+description: >-
+  Own the one authoritative version, move it forward only, and require the
+  release tag to agree with it.
+status: supported
+
+requires:
+  tools: [git, uv]
+  capabilities: []
+
+owns:
+  - ops/version/**
+
+reads:
+  - pyproject.toml
+  - CHANGELOG.md
+
+# `set` writes the `__version__` assignment in this file and nothing else in
+# it. Claims are per-path, so the coarser statement is the honest one to make
+# here; see ops/version/README.md.
+generates:
+  - src/cordis/__init__.py
+
+commands:
+  - name: show
+    summary: The current version, where it is written, and what the tags say.
+    lane: fast
+  - name: check
+    summary: One source of truth, a changelog section, and no tag ahead of it.
+    lane: fast
+    aggregate: check
+  - name: next
+    summary: Preview the next patch, minor or major version without writing it.
+    lane: fast
+    args: [part]
+  - name: set
+    summary: Move the version forward. Refuses to go backwards or sideways.
+    lane: fast
+    args: [version]
+  - name: verify-release
+    summary: HEAD is clean and carries an annotated tag matching the current version.
+    lane: fast
+  - name: sync
+    summary: Fetch tags from origin so a local check sees what was published.
+    lane: slow
+
+skills: []

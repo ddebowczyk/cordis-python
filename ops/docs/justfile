@@ -1,0 +1,17 @@
+# Documentation operations. `docs/reference.md` is derived, never written, and
+# `docs/build_reference.py` lives in `docs/` because that directory ships --
+# this capability runs it and owns neither.
+
+build:
+    uv run docs/build_reference.py
+
+check:
+    uv run docs/build_reference.py --check
+
+counters:
+    uv run ops/docs/bin/counters.py
+
+readme:
+    uv run pytest tests/test_readme.py -q
+
+all: check counters readme

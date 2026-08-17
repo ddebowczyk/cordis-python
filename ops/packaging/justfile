@@ -1,0 +1,15 @@
+# Wheel and sdist. `verify` asks what the artefact is; `smoke` asks whether it
+# works, which is a different question and the one that found both portability
+# defects in 0.1.0.
+
+build:
+    rm -rf dist
+    uv build
+
+verify:
+    uv run ops/packaging/bin/artefacts.py verify
+
+smoke:
+    uv run ops/packaging/bin/artefacts.py smoke
+
+all: build verify smoke

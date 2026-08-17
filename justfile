@@ -1,91 +1,97 @@
-# cordis-python task runner. Every recipe goes through uv.
+# cordis-python entry point.
+#
+# Nothing is defined here. Every operation belongs to a capability under
+# `ops/`, which owns its own scripts, schemas, documentation and recipes; this
+# file is the door. `just ops <capability> <command>` runs anything in the
+# catalogue, and the short names below are aliases for the ones reached for
+# most often.
+#
+#   just list                the catalogue
+#   just ops docs build      any capability command
+#   just check               every gate that declares itself part of `check`
+#
+# ops/README.md explains what a capability is and how ownership is enforced.
 
 default: check
 
-# Install/refresh the dev environment.
-sync:
-    uv sync --all-extras
+# --------------------------------------------------------------------------
+# The catalogue
+# --------------------------------------------------------------------------
 
-# Lint and type gate. This is what CI enforces and what must be clean before
-# any capability task is closed.
-check: lint types
+# Run any command of any capability: `just ops release status`.
+ops capability command *args:
+    @just --justfile ops/{{ capability }}/justfile --working-directory . {{ command }} {{ args }}
+
+# What capabilities exist, what they provide, and what they run.
+list:
+    @just ops control list
+
+# Hold every manifest to what it claims.
+validate:
+    @just ops control validate
+
+# --------------------------------------------------------------------------
+# Repository-wide lanes
+#
+# Assembled from the manifests: a command joins a lane by declaring
+# `aggregate: check` (or `aggregate: test`) in its own capability. There is no
+# list here that can fall out of step with the capabilities it covers.
+# --------------------------------------------------------------------------
+
+check:
+    @just ops control aggregate check
+
+check-tests:
+    @just ops control aggregate test
+
+# --------------------------------------------------------------------------
+# Aliases
+# --------------------------------------------------------------------------
+
+sync:
+    @just ops workflow sync
+
+doctor:
+    @just ops workflow doctor
+
+ci:
+    @just ops workflow ci
 
 lint:
-    uv run ruff check .
-    uv run ruff format --check .
-
-fix:
-    uv run ruff check --fix .
-    uv run ruff format .
+    @just ops quality lint
 
 types:
-    uv run mypy
+    @just ops quality types
 
-# Fast feedback: local-tier property tests only.
+fix:
+    @just ops quality fix
+
 test:
-    HYPOTHESIS_PROFILE=local uv run pytest -m "not tier_nightly and not tier_release"
+    @just ops test fast
 
-# What a pull request runs.
 test-pr:
-    HYPOTHESIS_PROFILE=pr uv run pytest -m "not tier_release"
+    @just ops test pr
 
-# Longer campaigns. Not part of the fast loop.
 test-nightly:
-    HYPOTHESIS_PROFILE=nightly uv run pytest
+    @just ops test nightly
 
-# Exhaustive: before a release, or when reproducing an incident.
 test-release:
-    HYPOTHESIS_PROFILE=release uv run pytest
+    @just ops test release
 
-# Replay a specific shrunk failure recorded in the example database.
-replay TEST:
-    HYPOTHESIS_PROFILE=local uv run pytest "{{TEST}}" -x
+replay selector:
+    @just ops test replay "{{ selector }}"
 
-# Generator health, worst first. Read this as a trend, not a filter rate:
-# Hypothesis counts its own overruns and duplicate draws as "invalid", so a
-# strategy containing no filter at all still reports 10-20%. A number well
-# above its neighbours is the signal worth chasing.
 discards:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    HYPOTHESIS_PROFILE=pr uv run pytest -q --hypothesis-show-statistics \
-      | awk '/^tests\/.*::/ {name=$0} /passing,.*invalid/ {
-            inv=$7; pass=$2; total=pass+inv;
-            printf "%5.1f%%  %4d invalid / %4d passing  %s\n",
-                   (total ? 100*inv/total : 0), inv, pass, name }' \
-      | sort -rn
+    @just ops test discards
 
-# Validate the capability catalog: per-file schema, then cross-file
-# consistency (dependency resolution, tier ordering, evidence references,
-# property-card coverage of every MUST).
-#
-# The schema is JSON Schema 2020-12 written in YAML, validated with
-# `check-jsonschema` so this recipe and CI run the same command on the same
-# tool. `ys -f spec/schema/capability.v1.yaml <file>` checks one file against
-# the same schema when that is closer to hand.
 spec-check:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    uvx check-jsonschema --schemafile spec/schema/capability.v1.yaml spec/capabilities/*.yaml
-    uv run spec/check_spec.py
+    @just ops spec check
 
-# Print the capability catalog as a build-order table.
 spec-table:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    printf '%-24s %4s %5s %6s  %s\n' capability tier rules props depends_on
-    for f in spec/capabilities/*.yaml; do
-        yq -r '.id + "|" + (.tier|tostring) + "|" + (.semantics|length|tostring) + "|" + (.properties|length|tostring) + "|" + ((.depends_on // [])|join(","))' "$f"
-    done | awk -F'|' '{printf "%-24s %4s %5s %6s  %s\n",$1,$2,$3,$4,$5}'
+    @just ops spec table
 
-# Regenerate the API reference from the docstrings and the capability records.
 docs:
-    uv run docs/build_reference.py
+    @just ops docs build
 
-# Fail if the checked-in reference no longer matches the code. Part of CI so a
-# renamed export cannot leave the documentation describing the old name.
 docs-check:
-    uv run docs/build_reference.py --check
-
-# Everything CI runs, in CI's order.
-ci: spec-check check docs-check test-pr
+    @just ops docs check

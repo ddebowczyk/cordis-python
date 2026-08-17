@@ -1,0 +1,14 @@
+# The catalogue's own operations. Recipes assume the repository root as the
+# working directory, which the root `justfile` and `ops/justfile` both set.
+
+validate:
+    uv run ops/bin/ops.py validate
+
+list:
+    uv run ops/bin/ops.py list
+
+aggregate lane:
+    uv run ops/bin/ops.py aggregate {{ lane }}
+
+test:
+    uv run pytest ops/control/tests -q

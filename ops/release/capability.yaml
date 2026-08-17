@@ -1,0 +1,48 @@
+$schema: ../capabilities/schema/capability.v1.yaml
+schema_version: ops-capability/v1
+
+id: release
+provides: distribution
+description: >-
+  Cut a GitHub Release: check that everything a release depends on is ready,
+  take the notes from the changelog, tag, and attach the artefacts.
+status: supported
+
+requires:
+  tools: [gh, git, just, uv]
+  capabilities: [version, packaging, quality, test, docs, spec]
+
+owns:
+  - ops/release/**
+
+reads:
+  - CHANGELOG.md
+  - pyproject.toml
+  - .github/workflows/release.yml
+
+generates: []
+
+commands:
+  - name: status
+    summary: Everything a release depends on, each answered yes or no.
+    lane: fast
+  - name: notes
+    summary: Print the changelog section for a version, as the release body.
+    lane: fast
+    args: [version]
+  - name: gate
+    summary: Run every gate a release requires, in order, and stop at the first failure.
+    lane: slow
+  - name: publish
+    summary: >-
+      Tag the current version and create the GitHub Release with its
+      artefacts. Prints its plan and stops unless given --confirm.
+    lane: slow
+    args: [confirm]
+  - name: verify
+    summary: Check the published release exists, is not a draft, and carries the artefacts.
+    lane: slow
+
+skills:
+  - name: cutting-a-release
+    summary: Take a version from green to published without skipping what the tag claims.

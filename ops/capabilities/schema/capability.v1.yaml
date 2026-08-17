@@ -1,0 +1,187 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://github.com/ddebowczyk/cordis-python/ops/capabilities/schema/capability.v1.yaml"
+title: Repository Operations Capability (v1)
+description: >-
+  One repository operation, described well enough that it can be found, run and
+  moved without reading its implementation. A manifest states what the
+  capability is for, which tools and peers it needs, which paths it owns, reads
+  and generates, and which commands and agent skills it exposes.
+
+  The path declarations are the load-bearing part. `ops/bin/ops_validate.py`
+  holds every manifest to them: no two capabilities may claim the same path, a
+  capability may not write into another's territory, and every file under
+  `ops/` must have exactly one owner. Without that, a directory per capability
+  is a longer path to the same tangle.
+
+type: object
+additionalProperties: false
+required:
+  - schema_version
+  - id
+  - provides
+  - description
+  - status
+  - requires
+  - owns
+  - reads
+  - generates
+  - commands
+  - skills
+
+properties:
+
+  $schema:
+    description: >-
+      Optional self-declaration so a validator can select the schema without
+      being told. Must match `schema_version`.
+    type: string
+
+  schema_version:
+    description: >-
+      Version of THIS manifest format. A validator selects its schema file by
+      this value, which is how the format evolves without silently
+      reinterpreting manifests written against an older one.
+    const: ops-capability/v1
+
+  id:
+    description: >-
+      The capability's name, and its directory name under `ops/`. The two are
+      required to match so a path names its owner.
+    type: string
+    pattern: ^[a-z][a-z0-9-]*$
+
+  provides:
+    description: >-
+      The interface this capability implements. `ops.yaml` binds one provider
+      per interface, so two capabilities may offer the same interface while
+      only one is active -- the seam that makes an operation replaceable
+      instead of merely relocatable.
+    type: string
+    pattern: ^[a-z][a-z0-9-]*$
+
+  description:
+    description: What the capability is for, in one sentence, in the imperative.
+    type: string
+    minLength: 1
+
+  status:
+    description: >-
+      `supported` is a promise: the commands work and their behaviour will not
+      change without a changelog entry. `experimental` says the shape is still
+      moving. `deprecated` says a replacement exists and names it in the README.
+    enum: [supported, experimental, deprecated]
+
+  requires:
+    description: >-
+      Everything that must exist before any command in this capability can run.
+      `tools` are executables on PATH -- the doctor reports them by reading
+      these, so this list is the requirement rather than a restatement of it.
+    type: object
+    additionalProperties: false
+    required: [tools, capabilities]
+    properties:
+      tools:
+        type: array
+        uniqueItems: true
+        items:
+          type: string
+          minLength: 1
+      capabilities:
+        description: >-
+          Peer capabilities whose commands this one invokes. The graph must be
+          acyclic and every name must resolve.
+        type: array
+        uniqueItems: true
+        items:
+          type: string
+          pattern: ^[a-z][a-z0-9-]*$
+
+  owns:
+    description: >-
+      Paths this capability is the sole author of. Claims may not overlap
+      another capability's `owns` or `generates`.
+    $ref: "#/$defs/paths"
+
+  reads:
+    description: >-
+      Paths the capability depends on but must never write. A path that appears
+      here may not also appear in `owns` or `generates`: "I read this" and "I
+      write this" are different relationships and conflating them hides which
+      capability is responsible when the file is wrong.
+    $ref: "#/$defs/paths"
+
+  generates:
+    description: >-
+      Paths the capability writes that are derived, not authored -- a generated
+      reference, a built wheel. Separate from `owns` because a generated file
+      may be deleted and rebuilt, and because reviewing a diff means knowing
+      which side of that line a change fell on.
+    $ref: "#/$defs/paths"
+
+  commands:
+    description: >-
+      Every entry point, each of which must exist as a recipe in the
+      capability's `justfile`. The manifest is the index; the justfile is the
+      implementation; the validator holds them to each other.
+    type: array
+    uniqueItems: true
+    items:
+      type: object
+      additionalProperties: false
+      required: [name, summary, lane]
+      properties:
+        name:
+          type: string
+          pattern: ^[a-z][a-z0-9-]*$
+        summary:
+          type: string
+          minLength: 1
+        lane:
+          description: >-
+            `fast` is safe in a save-loop -- seconds, no network. `slow` means
+            a human should have chosen to wait for it.
+          enum: [fast, slow]
+        aggregate:
+          description: >-
+            Marks this command as a member of a repository-wide lane, so
+            `just ops check` and `just ops test` are assembled from the
+            manifests rather than maintained as a second list that can drift.
+          enum: [check, test]
+        args:
+          description: Positional parameters, in the order the recipe takes them.
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+
+  skills:
+    description: >-
+      Procedures written for an agent rather than a shell: each needs a
+      `skills/<name>/SKILL.md` with `name` and `description` frontmatter. A
+      command is what to run; a skill is how to decide.
+    type: array
+    uniqueItems: true
+    items:
+      type: object
+      additionalProperties: false
+      required: [name, summary]
+      properties:
+        name:
+          type: string
+          pattern: ^[a-z][a-z0-9-]*$
+        summary:
+          type: string
+          minLength: 1
+
+$defs:
+  paths:
+    description: >-
+      Repository-relative glob patterns. `*` matches within one segment, `**`
+      matches across segments. No leading slash, no `./` prefix.
+    type: array
+    uniqueItems: true
+    items:
+      type: string
+      minLength: 1
+      pattern: ^[^/].*$

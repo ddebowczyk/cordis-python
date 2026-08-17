@@ -1,0 +1,20 @@
+# Version management. One authoritative version -- `cordis.__version__`, which
+# hatch reads at build time -- moved forward only.
+
+show:
+    uv run ops/version/bin/version.py show
+
+check:
+    uv run ops/version/bin/version.py check
+
+next part:
+    uv run ops/version/bin/version.py next {{ part }}
+
+set version:
+    uv run ops/version/bin/version.py set {{ version }}
+
+verify-release:
+    uv run ops/version/bin/version.py verify-release
+
+sync:
+    git fetch --tags origin

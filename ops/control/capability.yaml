@@ -1,0 +1,49 @@
+$schema: ../capabilities/schema/capability.v1.yaml
+schema_version: ops-capability/v1
+
+id: control
+provides: operations-control
+description: >-
+  Maintain the repository-operations catalogue and hold every manifest to what
+  it claims.
+status: supported
+
+requires:
+  tools: [just, uv, uvx]
+  capabilities: []
+
+owns:
+  - ops/README.md
+  - ops/ops.yaml
+  - ops/justfile
+  - ops/bin/**
+  - ops/capabilities/**
+  - ops/control/**
+  - docs/ops/**
+
+reads:
+  - ops/*/capability.yaml
+  - ops/*/justfile
+
+generates: []
+
+commands:
+  - name: validate
+    summary: Check schemas, path ownership, recipes, the graph, and the providers.
+    lane: fast
+    aggregate: check
+  - name: list
+    summary: Print the catalogue as a table.
+    lane: fast
+  - name: aggregate
+    summary: Run every command that declares itself part of a repository-wide lane.
+    lane: slow
+    args: [lane]
+  - name: test
+    summary: Test the validator against the live catalogue.
+    lane: fast
+    aggregate: test
+
+skills:
+  - name: repository-operations
+    summary: Add or change a repository operation without leaving it unowned.

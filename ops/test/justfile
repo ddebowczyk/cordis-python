@@ -1,0 +1,42 @@
+# The test tiers. Each is one Hypothesis profile and one marker selection; the
+# profiles are registered in `tests/conftest.py` and the markers mirror the
+# `test_tier` field of every property card in `spec/capabilities/`.
+
+fast:
+    HYPOTHESIS_PROFILE=local uv run pytest -m "not tier_nightly and not tier_release"
+
+pr:
+    HYPOTHESIS_PROFILE=pr uv run pytest -m "not tier_release"
+
+nightly:
+    HYPOTHESIS_PROFILE=nightly uv run pytest
+
+release:
+    HYPOTHESIS_PROFILE=release uv run pytest
+
+replay selector:
+    HYPOTHESIS_PROFILE=local uv run pytest "{{ selector }}" -x
+
+# Hypothesis counts its own overruns and duplicate draws as "invalid", so a
+# strategy with no filter at all still reports 10-20%. A number well above its
+# neighbours is the signal worth chasing.
+discards:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    HYPOTHESIS_PROFILE=pr uv run pytest -q --hypothesis-show-statistics \
+      | awk '/^tests\/.*::/ {name=$0} /passing,.*invalid/ {
+            inv=$7; pass=$2; total=pass+inv;
+            printf "%5.1f%%  %4d invalid / %4d passing  %s\n",
+                   (total ? 100*inv/total : 0), inv, pass, name }' \
+      | sort -rn
+
+mutate campaign:
+    uv run ops/test/bin/mutate.py run {{ campaign }}
+
+# Validates the declaration before printing it: a campaign file that has
+# drifted from its schema is a campaign nobody is really running.
+campaigns:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uvx check-jsonschema --schemafile ops/test/schema/mutations.v1.yaml ops/test/mutations.yaml
+    uv run ops/test/bin/mutate.py list

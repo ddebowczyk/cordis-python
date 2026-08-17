@@ -1,0 +1,101 @@
+# The defects the suite claims to catch, written down so the claim can be
+# tested. Each mutation is a real bug that once shipped or could ship: the
+# harness makes it, runs the tests that are supposed to notice, and requires
+# them to fail. A mutation that survives is a hole in the suite, not a
+# curiosity.
+#
+# `before` must appear in the file exactly once. If a refactor moves the code,
+# the harness stops rather than quietly testing nothing.
+#
+# Validated against ops/test/schema/mutations.v1.yaml.
+$schema: ./schema/mutations.v1.yaml
+schema_version: ops-mutations/v1
+
+campaigns:
+  - name: portability
+    summary: >-
+      Defects that only appear on an interpreter the developer is not using.
+      All three of these shipped in 0.1.0 and were found by installing the
+      wheel, not by running the suite -- so the suite grew tests for them.
+    mutations:
+      - title: a mappingproxy dataclass default, which Python 3.11 refuses
+        test: tests/test_public_api.py
+        edits:
+          - file: src/cordis/layering.py
+            before: "    fields: Fields = field(default_factory=lambda: _EMPTY)"
+            after: "    fields: Fields = _EMPTY"
+
+      - title: the same default in the logging record
+        test: tests/test_public_api.py
+        edits:
+          - file: src/cordis/logging.py
+            before: "    extra: Mapping[str, object] = field(default_factory=lambda: _EMPTY)"
+            after: "    extra: Mapping[str, object] = _EMPTY"
+
+      - title: deciding weak-referenceability from __weakrefoffset__, which PyPy lacks
+        test: tests/test_plugin_mounting.py
+        edits:
+          - file: src/cordis/plugin.py
+            before: |4-
+                    try:
+                        cached = _ARITY_CACHE.get(target)
+                    except TypeError:
+                        # The target cannot be a weak key -- it is unhashable, or its type
+                        # holds no weak references. Both mean the same thing: inspect it again
+                        # rather than pin it in memory. Asking the cache is also the only
+                        # portable way to ask; `type(target).__weakrefoffset__` is a CPython
+                        # detail that PyPy does not define at all.
+                        return _classify(target)
+            after: |4-
+                    if not type(target).__weakrefoffset__:
+                        return _classify(target)
+                    cached = _ARITY_CACHE.get(target)
+
+  - name: documentation
+    summary: >-
+      The reference generator borrowing prose or signatures from the standard
+      library, which makes the checked-in file depend on the interpreter that
+      generated it and CI red on a machine that differs.
+    mutations:
+      - title: summarising a name by the type it happens to be bound to
+        test: tests/test_reference.py
+        edits:
+          - file: docs/build_reference.py
+            before: "    if not _home(obj):"
+            after: "    if False:"
+
+      - title: rendering an enum as its constructor
+        test: tests/test_reference.py
+        edits:
+          - file: docs/build_reference.py
+            before: "    if isinstance(obj, type) and issubclass(obj, Enum):"
+            after: "    if False:"
+
+  - name: core
+    summary: >-
+      Ordering rules that are easy to write correctly and easy to lose in a
+      refactor, because both directions run and only one is right.
+    mutations:
+      - title: disposing an effect's cleanups in registration order rather than reverse
+        test: tests/test_effect_scope.py
+        edits:
+          - file: src/cordis/effect.py
+            before: "        for disposer in reversed(record.disposers):"
+            after: "        for disposer in record.disposers:"
+
+      - title: stopping a fiber's children oldest-first
+        # Mounted children are what a fiber's `_children` holds, so the card
+        # that states the order (PROP-PLUGIN-003, SEM-004) lives here rather
+        # than with the lifecycle properties.
+        test: tests/test_plugin_mounting.py
+        edits:
+          - file: src/cordis/fiber.py
+            before: "        for child in reversed(tuple(self._children)):"
+            after: "        for child in tuple(self._children):"
+
+      - title: delivering an event to listeners in registration order
+        test: tests/test_events.py
+        edits:
+          - file: src/cordis/events.py
+            before: "        for entry in reversed(self._admitted(event, carrier)):"
+            after: "        for entry in self._admitted(event, carrier):"

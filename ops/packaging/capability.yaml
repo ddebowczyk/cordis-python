@@ -1,0 +1,41 @@
+$schema: ../capabilities/schema/capability.v1.yaml
+schema_version: ops-capability/v1
+
+id: packaging
+provides: package-integrity
+description: >-
+  Build the wheel and sdist, check their shape and contents, and install them
+  into every supported interpreter to find what a source-tree test run cannot.
+status: supported
+
+requires:
+  tools: [uv, uvx]
+  capabilities: []
+
+owns:
+  - ops/packaging/**
+
+reads:
+  - pyproject.toml
+  - src/**
+  - spec/**
+  - README.md
+
+generates:
+  - dist/**
+
+commands:
+  - name: build
+    summary: Build the wheel and the sdist from a clean dist/.
+    lane: slow
+  - name: verify
+    summary: The wheel is pure Python, the sdist carries the catalog, the metadata renders.
+    lane: fast
+  - name: smoke
+    summary: Install the built wheel into 3.11, 3.12, 3.13 and pypy3.11 and import it.
+    lane: slow
+  - name: all
+    summary: Build, verify, then smoke -- what a release needs from packaging.
+    lane: slow
+
+skills: []

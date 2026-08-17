@@ -1,0 +1,75 @@
+name: nightly
+
+# Longer campaigns against fresh entropy, plus the question a pull request
+# cannot afford to ask: would the suite still catch the defects it claims to?
+#
+# Deliberately separate from ci.yml. `just ops workflow ci-check` compares that
+# file against the local `ci` lane step for step, and folding a schedule-only
+# branch into it would make the two lists disagree by design.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  campaigns:
+    name: property campaigns (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13", "pypy3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - uses: extractions/setup-just@v3
+      - run: uv python install ${{ matrix.python }}
+      - run: uv sync --all-extras --python ${{ matrix.python }}
+
+      - name: Restore Hypothesis example database
+        uses: actions/cache/restore@v4
+        with:
+          path: .hypothesis/examples
+          key: hypothesis-nightly-${{ matrix.python }}-${{ github.run_id }}
+          restore-keys: hypothesis-nightly-${{ matrix.python }}-
+
+      - run: just ops test nightly
+
+      - name: Save Hypothesis example database
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .hypothesis/examples
+          key: hypothesis-nightly-${{ matrix.python }}-${{ github.run_id }}
+
+  mutations:
+    name: mutation verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - uses: extractions/setup-just@v3
+      - run: uv sync --all-extras
+      - run: just ops test campaigns
+      # A survivor is a hole in the test suite, not a broken build step.
+      - run: just ops test mutate all
+
+  artefacts:
+    name: installed wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - uses: extractions/setup-just@v3
+      # Installing the artefact is what caught both 0.1.0 portability defects;
+      # testing the checkout did not. It is too slow for every pull request and
+      # too valuable to run only at release time.
+      - run: just ops packaging all

@@ -1,0 +1,33 @@
+# Repository operations. Every recipe here delegates to a capability; nothing
+# is implemented at this level, because an operation that lives in the index
+# has no owner.
+#
+# Address a capability directly:  just ops <capability> <command> [args]
+# See what exists:                just ops control list
+
+OPS := justfile_directory()
+ROOT := parent_directory(justfile_directory())
+
+_default:
+    @just --justfile {{ OPS }}/justfile --working-directory {{ ROOT }} --list
+
+# Hold every manifest to what it claims: schemas, path ownership,
+# command-to-recipe agreement, the dependency graph, the provider table.
+validate:
+    @just --justfile {{ OPS }}/control/justfile --working-directory {{ ROOT }} validate
+
+# What the catalogue contains.
+list:
+    @just --justfile {{ OPS }}/control/justfile --working-directory {{ ROOT }} list
+
+# Every tool the manifests require, and whether it is installed.
+doctor:
+    @just --justfile {{ OPS }}/workflow/justfile --working-directory {{ ROOT }} doctor
+
+# The repository-wide lanes, assembled from the manifests rather than kept as a
+# second list that can drift. See `aggregate:` in each capability.yaml.
+check:
+    @just --justfile {{ OPS }}/control/justfile --working-directory {{ ROOT }} aggregate check
+
+test:
+    @just --justfile {{ OPS }}/control/justfile --working-directory {{ ROOT }} aggregate test
