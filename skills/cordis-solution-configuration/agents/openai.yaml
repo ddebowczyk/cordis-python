@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cordis Solution Configuration"
+  short_description: "Configure declarative Cordis applications"
+  default_prompt: "Use $cordis-solution-configuration to configure this Cordis deployment."

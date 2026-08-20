@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cordis Solution Operations"
+  short_description: "Operate and observe live Cordis hosts"
+  default_prompt: "Use $cordis-solution-operations to operate this Cordis host."

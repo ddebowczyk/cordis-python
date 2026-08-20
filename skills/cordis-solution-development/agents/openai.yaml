@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cordis Solution Development"
+  short_description: "Build and test Cordis plugins safely"
+  default_prompt: "Use $cordis-solution-development to implement this Cordis capability."

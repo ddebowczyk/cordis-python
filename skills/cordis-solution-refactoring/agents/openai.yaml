@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cordis Solution Refactoring"
+  short_description: "Refactor Cordis systems without lifecycle regressions"
+  default_prompt: "Use $cordis-solution-refactoring to safely refactor this Cordis application."

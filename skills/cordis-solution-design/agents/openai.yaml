@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cordis Solution Design"
+  short_description: "Design reversible Cordis application structure"
+  default_prompt: "Use $cordis-solution-design to design this Cordis-based solution."

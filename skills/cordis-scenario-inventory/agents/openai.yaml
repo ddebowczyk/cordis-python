@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cordis Scenario Inventory"
+  short_description: "Select proven Cordis solution patterns"
+  default_prompt: "Use $cordis-scenario-inventory to route this need to the right Cordis pattern."

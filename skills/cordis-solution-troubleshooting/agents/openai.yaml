@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cordis Solution Troubleshooting"
+  short_description: "Diagnose Cordis lifecycle and configuration failures"
+  default_prompt: "Use $cordis-solution-troubleshooting to diagnose this Cordis issue."
