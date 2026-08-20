@@ -1,1 +1,1 @@
-sync.remote: ""
+sync.remote: "git+https://github.com/ddebowczyk/cordis-python.git"
